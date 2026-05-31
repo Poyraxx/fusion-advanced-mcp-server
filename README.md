@@ -2,6 +2,8 @@
 
 This repository provides a Fusion 360 add-in that exposes the active design through the Model Context Protocol (MCP). It is designed for local coding agents such as Codex that need to inspect, plan, modify, and export Fusion 360 geometry from an automated workflow.
 
+Once the add-in is installed into Fusion 360's Add-Ins directory, it can run from there without requiring this development repository to remain in place. The repository is mainly for development, packaging, and testing.
+
 ## Repository contents
 
 - `MCPserve/`: Fusion 360 add-in source code.
@@ -28,6 +30,8 @@ The server exposes Fusion 360 data and modeling actions through MCP so an agent 
 - Delete bodies created during iterative modeling.
 - Export sketches and designs to CAD exchange formats.
 - Use prompt helpers for sketch planning, parameter planning, and modeling strategy generation.
+- Inspect live Fusion API objects dynamically.
+- Execute arbitrary Fusion API Python against the live session when a fixed tool is not enough.
 
 ## Communication model
 
@@ -48,6 +52,7 @@ The SSE endpoint is the primary path. The file-based path is intentionally prese
 - `fusion://components`
 - `fusion://sketches`
 - `fusion://bodies`
+- `fusion://mcp-capabilities`
 
 ### Modeling tools
 
@@ -78,6 +83,11 @@ The SSE endpoint is the primary path. The file-based path is intentionally prese
 - `export_design_file`
 - `export_active_drawing_pdf`
 
+### Generic bridge tools
+
+- `inspect_fusion_object`
+- `execute_fusion_api`
+
 ### Prompt helpers
 
 - `create_sketch_prompt`
@@ -97,6 +107,17 @@ This project is not limited to a minimal sketch demo. The current implementation
 - Iterative cleanup by removing obsolete bodies.
 - Export to `STEP`, `IGES`, `SAT`, `STL`, `3MF`, `OBJ`, `DXF`, and drawing `PDF`.
 - File-based fallback commands for smoke testing even when direct MCP transport is unavailable.
+- Dynamic live inspection of Fusion API objects, collections, and selected entities.
+- A general-purpose execution bridge for unsupported or newly needed Fusion API features without waiting for a dedicated MCP tool.
+
+## Runtime mode
+
+The add-in supports two practical modes:
+
+1. Development mode: run from this repository while editing code and using helper scripts.
+2. Installed mode: run directly from Fusion 360's user Add-Ins folder with Codex or another MCP client, without depending on this repository path.
+
+In installed mode, the add-in still creates runtime artifacts such as `mcp_comm/` and export output near the installed add-in when needed.
 
 ## Requirements
 
@@ -157,6 +178,8 @@ python client.py --wait-ready --test-connection
 python client.py --list-resources --list-tools --list-prompts
 ```
 
+For direct MCP use from Codex, the most important requirement is that Fusion 360 is open and the `MCPserve` add-in is running. After that, a client can connect directly to `http://127.0.0.1:3000/sse`.
+
 ## Client usage examples
 
 Basic connection test:
@@ -177,6 +200,7 @@ Read a specific resource:
 
 ```powershell
 python client.py --test-resource fusion://bodies
+python client.py --test-resource fusion://mcp-capabilities
 ```
 
 Run simple tool tests:
@@ -193,6 +217,28 @@ Force a specific file-based communication directory:
 python client.py --comm-dir .\MCPserve\mcp_comm --list-tools
 ```
 
+## Generic Fusion API bridge
+
+The server now includes a generic execution path so an MCP client is not limited to the fixed built-in tool list.
+
+- `inspect_fusion_object` inspects a live object path such as `design.rootComponent.features`, `root_component.sketches`, or `cam.setups`.
+- `execute_fusion_api` runs Python inside the live Fusion session with useful prebound objects and helpers.
+
+The execution context includes:
+
+- `app`, `ui`, `doc`, `active_product`
+- `design`, `drawing`, `cam`
+- `root_component`
+- `selected_entities`, `selected_tokens`
+- `find_component`, `find_sketch`, `find_body`, `find_plane`, `find_axis`, `find_entity`
+- `find_profile_entity`
+- `point3d`, `point2d`
+- `length_value`, `length_input`, `angle_value`, `angle_input`
+- `exports_dir`, `comm_dir`
+- `state` for lightweight cross-call memory
+
+This means a Codex session can reach most of the public Fusion API surface even if a dedicated MCP tool has not been implemented yet.
+
 ## Troubleshooting
 
 - If Fusion cannot import the add-in, confirm that `MCPserve/MCPserve.manifest` exists and matches the folder name.
@@ -200,6 +246,7 @@ python client.py --comm-dir .\MCPserve\mcp_comm --list-tools
 - If the SSE endpoint is unavailable, use the file-based path from `client.py`.
 - If package imports fail inside Fusion, rerun `install_mcp_for_fusion.py` against Fusion's bundled Python.
 - If the active document is a single-part design, component creation may be limited by Fusion 360 document rules.
+- If a needed feature is not covered by the fixed tools, use the generic bridge described above instead of treating it as unsupported.
 
 ## References
 

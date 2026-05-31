@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import adsk.core
+import adsk.cam
 import adsk.drawing
 import adsk.fusion
 import os
@@ -10,6 +11,7 @@ import threading
 import time
 import json
 import asyncio
+import math
 import re
 from pathlib import Path
 
@@ -22,6 +24,7 @@ message_command_handlers = []  # Store command handlers to prevent garbage colle
 
 # Initialize the global handlers list
 handlers = []
+SCRIPT_STATE = {}
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 3000
@@ -34,6 +37,7 @@ RESOURCE_URIS = [
     "fusion://components",
     "fusion://sketches",
     "fusion://bodies",
+    "fusion://mcp-capabilities",
 ]
 
 TOOL_METADATA = [
@@ -60,6 +64,8 @@ TOOL_METADATA = [
     {"name": "export_sketch_dxf", "description": "Export a sketch to a DXF file"},
     {"name": "export_design_file", "description": "Export the active design to STEP, IGES, SAT, STL, 3MF, or OBJ"},
     {"name": "export_active_drawing_pdf", "description": "Export the active drawing document to PDF"},
+    {"name": "inspect_fusion_object", "description": "Inspect any live Fusion API object by Python path and list its members"},
+    {"name": "execute_fusion_api", "description": "Execute arbitrary Python against the live Fusion API with design, drawing, and CAM context"},
 ]
 
 PROMPT_METADATA = [
@@ -336,6 +342,26 @@ def point_to_dict(point):
     }
 
 
+def point2d_to_dict(point):
+    if not point:
+        return None
+    return {
+        "x": point.x,
+        "y": point.y,
+    }
+
+
+def safe_repr(value, max_length=240):
+    try:
+        text = repr(value)
+    except Exception as exc:
+        text = f"<unreprable {type(value).__name__}: {exc}>"
+
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
+
+
 def error_payload(prefix, exc):
     return {
         "error": f"{prefix}: {exc}",
@@ -443,6 +469,57 @@ def point3d_from_data(design, point_data, default_unit=None):
         return make_point3d(design, values[0], values[1], values[2], default_unit)
 
     raise ValueError(f"Unsupported point format: {point_data!r}")
+
+
+def get_active_products_context():
+    doc = app.activeDocument
+    design, design_error = get_design(doc)
+
+    drawing = None
+    cam = None
+    active_product = None
+
+    if doc:
+        try:
+            active_product = doc.products.activeProduct
+        except Exception:
+            active_product = None
+
+        try:
+            drawing_product = doc.products.itemByProductType("DrawingProductType")
+            if drawing_product:
+                drawing = adsk.drawing.Drawing.cast(drawing_product)
+        except Exception:
+            drawing = None
+
+        try:
+            cam_product = doc.products.itemByProductType("CAMProductType")
+            if cam_product:
+                cam = adsk.cam.CAM.cast(cam_product)
+        except Exception:
+            cam = None
+
+    return {
+        "doc": doc,
+        "design": design,
+        "design_error": design_error,
+        "drawing": drawing,
+        "cam": cam,
+        "active_product": active_product,
+    }
+
+
+def get_selected_entities():
+    entities = []
+    try:
+        selections = ui.activeSelections
+        for index in range(selections.count):
+            selection = selections.item(index)
+            if selection and selection.entity:
+                entities.append(selection.entity)
+    except Exception:
+        pass
+    return entities
 
 
 def get_all_components(design):
@@ -917,6 +994,375 @@ def serialize_dimension(dimension):
     return data
 
 
+def is_adsk_like(value):
+    module_name = getattr(type(value), "__module__", "")
+    return module_name.startswith("adsk") or hasattr(value, "objectType")
+
+
+def serialize_collection_preview(collection, depth=0, max_depth=3, max_items=10):
+    count = safe_count(collection)
+    preview = []
+    if depth < max_depth:
+        for index, item in enumerate(iter_collection(collection)):
+            if index >= max_items:
+                break
+            preview.append(make_jsonable(item, depth + 1, max_depth, max_items))
+
+    return {
+        "python_type": type(collection).__name__,
+        "count": count,
+        "items": preview,
+        "truncated": count > len(preview),
+    }
+
+
+def serialize_adsk_object(value, depth=0, max_depth=3, max_items=10):
+    try:
+        point3d = adsk.core.Point3D.cast(value)
+    except Exception:
+        point3d = None
+    if point3d:
+        return point_to_dict(point3d)
+
+    try:
+        point2d = adsk.core.Point2D.cast(value)
+    except Exception:
+        point2d = None
+    if point2d:
+        return point2d_to_dict(point2d)
+
+    try:
+        vector3d = adsk.core.Vector3D.cast(value)
+    except Exception:
+        vector3d = None
+    if vector3d:
+        return {"x": vector3d.x, "y": vector3d.y, "z": vector3d.z}
+
+    component = adsk.fusion.Component.cast(value)
+    if component:
+        data = serialize_component(component)
+        data["entity_type"] = "Component"
+        return data
+
+    sketch = adsk.fusion.Sketch.cast(value)
+    if sketch:
+        data = serialize_sketch(sketch)
+        data["entity_type"] = "Sketch"
+        return data
+
+    body = adsk.fusion.BRepBody.cast(value)
+    if body:
+        data = serialize_body(body)
+        data["entity_type"] = "BRepBody"
+        return data
+
+    profile = adsk.fusion.Profile.cast(value)
+    if profile:
+        data = serialize_profile(profile, -1)
+        data["entity_type"] = "Profile"
+        return data
+
+    sketch_entity = adsk.fusion.SketchEntity.cast(value)
+    if sketch_entity:
+        return serialize_sketch_entity(sketch_entity)
+
+    data = {
+        "python_type": type(value).__name__,
+        "object_type": safe_object_type(value),
+        "repr": safe_repr(value),
+    }
+
+    name = safe_get_name(value)
+    if name:
+        data["name"] = name
+
+    token = safe_entity_token(value)
+    if token:
+        data["token"] = token
+
+    count = safe_count(value)
+    if count:
+        data["count"] = count
+        if depth < max_depth:
+            preview = []
+            for index, item in enumerate(iter_collection(value)):
+                if index >= max_items:
+                    break
+                preview.append(make_jsonable(item, depth + 1, max_depth, max_items))
+            data["items"] = preview
+            data["truncated"] = count > len(preview)
+
+    return data
+
+
+def make_jsonable(value, depth=0, max_depth=3, max_items=10):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, dict):
+        items = list(value.items())
+        result = {}
+        for index, (key, item_value) in enumerate(items):
+            if index >= max_items:
+                result["__truncated__"] = f"{len(items) - max_items} additional entries omitted"
+                break
+            result[str(key)] = make_jsonable(item_value, depth + 1, max_depth, max_items)
+        return result
+
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        result = [
+            make_jsonable(item, depth + 1, max_depth, max_items)
+            for item in items[:max_items]
+        ]
+        if len(items) > max_items:
+            result.append({"__truncated__": len(items) - max_items})
+        return result
+
+    if callable(value):
+        return {
+            "callable": True,
+            "name": getattr(value, "__name__", type(value).__name__),
+            "repr": safe_repr(value),
+        }
+
+    if depth >= max_depth:
+        return safe_repr(value)
+
+    if is_adsk_like(value):
+        return serialize_adsk_object(value, depth, max_depth, max_items)
+
+    count = safe_count(value)
+    if count:
+        return serialize_collection_preview(value, depth, max_depth, max_items)
+
+    return safe_repr(value)
+
+
+def build_script_builtins(print_fn):
+    return {
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "dict": dict,
+        "enumerate": enumerate,
+        "Exception": Exception,
+        "filter": filter,
+        "float": float,
+        "getattr": getattr,
+        "hasattr": hasattr,
+        "int": int,
+        "isinstance": isinstance,
+        "len": len,
+        "list": list,
+        "max": max,
+        "map": map,
+        "min": min,
+        "next": next,
+        "object": object,
+        "pow": pow,
+        "print": print_fn,
+        "range": range,
+        "repr": repr,
+        "reversed": reversed,
+        "round": round,
+        "set": set,
+        "setattr": setattr,
+        "slice": slice,
+        "sorted": sorted,
+        "str": str,
+        "sum": sum,
+        "tuple": tuple,
+        "RuntimeError": RuntimeError,
+        "TypeError": TypeError,
+        "type": type,
+        "ValueError": ValueError,
+        "zip": zip,
+    }
+
+
+def build_fusion_script_context(input_data=None, print_fn=None):
+    products = get_active_products_context()
+    doc = products["doc"]
+    design = products["design"]
+    drawing = products["drawing"]
+    cam = products["cam"]
+    selected_entities = get_selected_entities()
+    exports_dir = ensure_dir((REPO_ROOT or ADDIN_DIR) / "exports")
+    printer = print_fn or (lambda *args, **kwargs: None)
+
+    def make_local_point3d(x, y, z=0.0, unit=None):
+        if design:
+            return make_point3d(design, x, y, z, unit)
+        return adsk.core.Point3D.create(float(x), float(y), float(z))
+
+    def make_local_point2d(x, y):
+        return adsk.core.Point2D.create(float(x), float(y))
+
+    def local_length_value(value, unit=None):
+        if not design:
+            return value
+        return length_value(design, value, unit)
+
+    def local_length_input(value, unit=None):
+        if not design:
+            return adsk.core.ValueInput.createByString(str(value))
+        return length_value_input(design, value, unit)
+
+    def local_angle_value(value, unit="deg"):
+        if not design:
+            return value
+        return angle_value(design, value, unit)
+
+    def local_angle_input(value, unit="deg"):
+        if not design:
+            return adsk.core.ValueInput.createByString(str(value))
+        return angle_value_input(design, value, unit)
+
+    return {
+        "adsk": adsk,
+        "app": app,
+        "ui": ui,
+        "doc": doc,
+        "document": doc,
+        "active_product": products["active_product"],
+        "design": design,
+        "design_error": products["design_error"],
+        "drawing": drawing,
+        "cam": cam,
+        "root_component": design.rootComponent if design else None,
+        "selected_entities": selected_entities,
+        "selected_tokens": [safe_entity_token(entity) for entity in selected_entities],
+        "input_data": input_data if input_data is not None else {},
+        "state": SCRIPT_STATE,
+        "math": math,
+        "json": json,
+        "re": re,
+        "time": time,
+        "Path": Path,
+        "exports_dir": exports_dir,
+        "comm_dir": primary_comm_dir(),
+        "serialize": make_jsonable,
+        "log": printer,
+        "print": printer,
+        "point3d": make_local_point3d,
+        "point2d": make_local_point2d,
+        "length_value": local_length_value,
+        "length_input": local_length_input,
+        "angle_value": local_angle_value,
+        "angle_input": local_angle_input,
+        "find_component": (lambda component_name="": find_component(design, component_name)) if design else (lambda component_name="": None),
+        "find_sketch": (lambda sketch_name, component_name="": find_sketch(design, sketch_name, component_name)) if design else (lambda sketch_name, component_name="": None),
+        "find_body": (lambda body_name, component_name="": find_body(design, body_name, component_name)) if design else (lambda body_name, component_name="": None),
+        "find_plane": (lambda plane_name, component_name="": find_planar_entity(design, plane_name, component_name)) if design else (lambda plane_name, component_name="": None),
+        "find_axis": (lambda axis_name, component_name="": find_axis_entity(design, axis_name, component_name)) if design else (lambda axis_name, component_name="": None),
+        "find_entity": (lambda token: find_entity_by_token(design, token)) if design else (lambda token: None),
+        "find_profile_entity": (
+            lambda sketch_name="", component_name="", profile_index=0, profile_token="": resolve_profile_entity(
+                design,
+                sketch_name,
+                component_name,
+                profile_index,
+                profile_token,
+            )
+        ) if design else (lambda **kwargs: None),
+        "occurrence_for": (lambda component: find_occurrence_for_component(design, component)) if design else (lambda component: None),
+        "entity_token": safe_entity_token,
+        "entity_name": safe_get_name,
+    }
+
+
+def inspect_fusion_object_impl(path="root_component", include_private=False, max_members=200, include_values=True):
+    try:
+        expression = path if not is_blank(path) else "root_component"
+        namespace = build_fusion_script_context()
+        namespace["__builtins__"] = build_script_builtins(namespace["print"])
+        target = eval(expression, namespace, namespace)
+
+        member_names = sorted(dir(target))
+        if not include_private:
+            member_names = [name for name in member_names if not name.startswith("_")]
+
+        members = []
+        member_limit = max(0, int(max_members))
+        for name in member_names[:member_limit]:
+            entry = {"name": name}
+            try:
+                attr = getattr(target, name)
+                entry["kind"] = "method" if callable(attr) else "attribute"
+                entry["python_type"] = type(attr).__name__
+                if callable(attr):
+                    entry["repr"] = safe_repr(attr, 120)
+                elif include_values:
+                    entry["value"] = make_jsonable(attr, 1, 1, 5)
+            except Exception as exc:
+                entry["kind"] = "error"
+                entry["error"] = str(exc)
+            members.append(entry)
+
+        return {
+            "path": expression,
+            "summary": make_jsonable(target, 0, 2, 8),
+            "member_count": len(member_names),
+            "members": members,
+            "truncated": len(member_names) > len(members),
+            "context_keys": sorted(key for key in namespace.keys() if not key.startswith("__")),
+        }
+    except Exception as exc:
+        return error_payload("inspect_fusion_object failed", exc)
+
+
+def execute_fusion_api_impl(script="", expression="", input_data=None, result_variable="result"):
+    logs = []
+
+    def capture_print(*values, sep=" ", end="\n"):
+        message = sep.join(str(value) for value in values)
+        if end:
+            message += end.rstrip("\n")
+        logs.append(message)
+
+    try:
+        if is_blank(script) and is_blank(expression):
+            raise ValueError("script or expression is required")
+
+        namespace = build_fusion_script_context(input_data, capture_print)
+        namespace["__builtins__"] = build_script_builtins(capture_print)
+        namespace[result_variable] = None
+
+        if not is_blank(expression):
+            namespace[result_variable] = eval(expression, namespace, namespace)
+
+        if not is_blank(script):
+            code = compile(str(script), "<fusion_mcp>", "exec")
+            exec(code, namespace, namespace)
+
+        raw_result = namespace.get(result_variable)
+        SCRIPT_STATE["last_result"] = raw_result
+
+        return {
+            "success": True,
+            "result_variable": result_variable,
+            "result": make_jsonable(raw_result, 0, 4, 20),
+            "logs": logs,
+            "state_keys": sorted(str(key) for key in SCRIPT_STATE.keys()),
+            "context": {
+                "document_type": get_document_type_name(namespace["doc"]) if namespace.get("doc") else None,
+                "has_design": bool(namespace.get("design")),
+                "has_drawing": bool(namespace.get("drawing")),
+                "has_cam": bool(namespace.get("cam")),
+                "selected_count": len(namespace.get("selected_entities", [])),
+            },
+        }
+    except Exception as exc:
+        payload = error_payload("execute_fusion_api failed", exc)
+        payload["logs"] = logs
+        return payload
+
+
 def get_active_document_info_resource():
     try:
         doc = app.activeDocument
@@ -969,6 +1415,29 @@ def get_bodies_resource():
         return {"bodies": bodies}
     except Exception as exc:
         return error_payload("Error reading bodies", exc)
+
+
+def get_mcp_capabilities_resource():
+    try:
+        context_keys = sorted(build_fusion_script_context().keys())
+        return {
+            "resources": RESOURCE_URIS,
+            "tools": TOOL_METADATA,
+            "prompts": PROMPT_METADATA,
+            "generic_bridge": {
+                "inspect_tool": "inspect_fusion_object",
+                "execute_tool": "execute_fusion_api",
+                "stateful": True,
+                "context_keys": context_keys,
+                "notes": [
+                    "execute_fusion_api exposes design, drawing, cam, selection, and helper find_* functions.",
+                    "Use inspect_fusion_object with Python paths such as design.rootComponent.features or cam.setups.",
+                    "Interactive UI commands may still need manual user interaction, but API coverage is no longer limited to the fixed tool list.",
+                ],
+            },
+        }
+    except Exception as exc:
+        return error_payload("Error reading MCP capabilities", exc)
 
 
 def get_parameters_resource():
@@ -1839,6 +2308,11 @@ def run_mcp_server():
             """Get the bodies in the active design."""
             return get_bodies_resource()
 
+        @fusion_mcp.resource("fusion://mcp-capabilities")
+        def get_mcp_capabilities():
+            """Describe the fixed MCP surface and the generic Fusion API bridge."""
+            return get_mcp_capabilities_resource()
+
         print("Registering tools...")
 
         @fusion_mcp.tool()
@@ -1956,6 +2430,16 @@ def run_mcp_server():
             """Export the active drawing document to PDF."""
             return export_active_drawing_pdf_impl(filename)
 
+        @fusion_mcp.tool()
+        def inspect_fusion_object(path: str = "root_component", include_private: bool = False, max_members: int = 200, include_values: bool = True) -> dict:
+            """Inspect any live Fusion API object by Python path and list its members."""
+            return inspect_fusion_object_impl(path, include_private, max_members, include_values)
+
+        @fusion_mcp.tool()
+        def execute_fusion_api(script: str = "", expression: str = "", input_data: dict = None, result_variable: str = "result") -> dict:
+            """Execute arbitrary Python against the live Fusion API with design, drawing, and CAM context."""
+            return execute_fusion_api_impl(script, expression, input_data, result_variable)
+
         print("Registering prompts...")
 
         @fusion_mcp.prompt()
@@ -1980,6 +2464,7 @@ def run_mcp_server():
             "fusion://components": get_components_resource,
             "fusion://sketches": get_sketches_resource,
             "fusion://bodies": get_bodies_resource,
+            "fusion://mcp-capabilities": get_mcp_capabilities_resource,
         }
 
         tool_dispatch = {
@@ -2006,6 +2491,8 @@ def run_mcp_server():
             "export_sketch_dxf": lambda params: export_sketch_dxf(**params),
             "export_design_file": lambda params: export_design_file(**params),
             "export_active_drawing_pdf": lambda params: export_active_drawing_pdf(**params),
+            "inspect_fusion_object": lambda params: inspect_fusion_object(**params),
+            "execute_fusion_api": lambda params: execute_fusion_api(**params),
         }
 
         prompt_dispatch = {

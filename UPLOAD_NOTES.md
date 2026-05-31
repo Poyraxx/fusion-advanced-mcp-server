@@ -1,4 +1,4 @@
-This folder is a clean GitHub upload package for the Fusion MCP project.
+﻿This folder is a clean GitHub upload package for the Fusion MCP project.
 
 Included:
 - MCPserve/
@@ -15,9 +15,10 @@ Intentionally excluded:
 - exports/
 - tmp_images/
 - __pycache__/
+- github_push_workdir/
 - local .vscode settings
 
 Purpose:
 - provide a clean repository upload set
 - exclude generated, machine-specific, and temporary files
-
+- document the generic Fusion API bridge and installed add-in workflow
