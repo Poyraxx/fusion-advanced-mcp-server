@@ -21,4 +21,4 @@ Intentionally excluded:
 Purpose:
 - provide a clean repository upload set
 - exclude generated, machine-specific, and temporary files
-- document the generic Fusion API bridge and installed add-in workflow
+- document the generic Fusion API bridge, Fusion Electronics support, and installed add-in workflow

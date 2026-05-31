@@ -1,6 +1,6 @@
 # Fusion 360 MCP Server
 
-This repository provides a Fusion 360 add-in that exposes the active design through the Model Context Protocol (MCP). It is designed for local coding agents such as Codex that need to inspect, plan, modify, and export Fusion 360 geometry from an automated workflow.
+This repository provides a Fusion 360 add-in that exposes the active Fusion session through the Model Context Protocol (MCP). It is designed for local coding agents such as Codex that need to inspect, plan, modify, export, and automate both Fusion mechanical design data and Fusion Electronics data from an automated workflow.
 
 Once the add-in is installed into Fusion 360's Add-Ins directory, it can run from there without requiring this development repository to remain in place. The repository is mainly for development, packaging, and testing.
 
@@ -20,6 +20,7 @@ Once the add-in is installed into Fusion 360's Add-Ins directory, it can run fro
 The server exposes Fusion 360 data and modeling actions through MCP so an agent can:
 
 - Read the active document, parameters, sketches, bodies, and overall design structure.
+- Read the active Fusion Electronics context, including open electronics documents, schematic state, board state, and libraries.
 - Create parameters and construction geometry for parametric workflows.
 - Create and inspect sketches.
 - Add sketch geometry such as points, lines, polylines, circles, rectangles, arcs, and splines.
@@ -29,9 +30,13 @@ The server exposes Fusion 360 data and modeling actions through MCP so an agent 
 - Create components when the active Fusion document supports them.
 - Delete bodies created during iterative modeling.
 - Export sketches and designs to CAD exchange formats.
+- Create electronics sheets and manage electronics transaction boundaries safely.
+- Upload and activate electronics projects and library files inside Fusion Electronics.
+- Export active electronics schematic, board, and library documents.
 - Use prompt helpers for sketch planning, parameter planning, and modeling strategy generation.
 - Inspect live Fusion API objects dynamically.
 - Execute arbitrary Fusion API Python against the live session when a fixed tool is not enough.
+- Execute live Fusion Electronics API and text commands for workflows that do not yet have a fixed dedicated MCP tool.
 
 ## Communication model
 
@@ -58,6 +63,16 @@ Recent stability improvements:
 - `fusion://sketches`
 - `fusion://bodies`
 - `fusion://mcp-capabilities`
+
+### Electronics resources
+
+- `fusion://electronics-context`
+- `fusion://electronics-schematic`
+- `fusion://electronics-board`
+- `fusion://electronics-library`
+- `fusion://electronics-libraries`
+- `fusion://electronics-documents`
+- `fusion://electronics-errors`
 
 ### Modeling tools
 
@@ -93,6 +108,20 @@ Recent stability improvements:
 - `inspect_fusion_object`
 - `execute_fusion_api`
 
+### Electronics tools
+
+- `create_electronics_sheet`
+- `begin_electronics_change`
+- `end_electronics_change`
+- `cancel_electronics_change`
+- `list_electronics_documents`
+- `upload_electronics_project`
+- `open_electronics_document`
+- `activate_electronics_document`
+- `export_electronics_file`
+- `execute_text_command`
+- `execute_electronics_api`
+
 ### Prompt helpers
 
 - `create_sketch_prompt`
@@ -115,6 +144,11 @@ This project is not limited to a minimal sketch demo. The current implementation
 - Main-thread dispatch for Fusion API calls to reduce instability during heavier modeling or export operations.
 - Dynamic live inspection of Fusion API objects, collections, and selected entities.
 - A general-purpose execution bridge for unsupported or newly needed Fusion API features without waiting for a dedicated MCP tool.
+- Fusion Electronics context inspection for active schematic, board, library, and project documents.
+- Electronics document upload and activation workflows for `SCH`, `BRD`, `LBR`, and their Fusion-managed `FSCH`, `FBRD`, `FLBR`, and `FPRJ` counterparts.
+- Electronics sheet creation and explicit transaction control for safer scripted edits.
+- Round-trip export of live Fusion Electronics documents back to electronics file formats.
+- A live electronics execution bridge for schematic and board automation when a dedicated tool is not yet present.
 
 ## Runtime mode
 
@@ -245,6 +279,19 @@ The execution context includes:
 
 This means a Codex session can reach most of the public Fusion API surface even if a dedicated MCP tool has not been implemented yet.
 
+## Fusion Electronics support
+
+The server now includes a first-class Fusion Electronics layer in addition to the mechanical modeling tools.
+
+- `fusion://electronics-context` reports the active electronics product state and linked documents.
+- `fusion://electronics-schematic` and `fusion://electronics-board` provide lightweight live summaries that are safer to query repeatedly than deep raw serialization.
+- `list_electronics_documents`, `open_electronics_document`, and `activate_electronics_document` help recover and control active `FSCH`, `FBRD`, `FPRJ`, and `FLBR` documents.
+- `upload_electronics_project` supports loading external electronics content into Fusion-managed documents.
+- `export_electronics_file` supports exporting the active live electronics document back out for handoff, verification, or versioning.
+- `execute_electronics_api` and `execute_text_command` provide an escape hatch for advanced electronics workflows that do not yet have a fixed MCP tool.
+
+In practice, this means a Codex workflow can inspect existing Fusion Electronics projects, create or activate sheets, upload generated electronics files, reopen them inside Fusion, verify their live schematic and board state, and export the result again without leaving the MCP loop.
+
 ## Troubleshooting
 
 - If Fusion cannot import the add-in, confirm that `MCPserve/MCPserve.manifest` exists and matches the folder name.
@@ -253,6 +300,7 @@ This means a Codex session can reach most of the public Fusion API surface even 
 - If package imports fail inside Fusion, rerun `install_mcp_for_fusion.py` against Fusion's bundled Python.
 - If the active document is a single-part design, component creation may be limited by Fusion 360 document rules.
 - If a needed feature is not covered by the fixed tools, use the generic bridge described above instead of treating it as unsupported.
+- If Fusion Electronics reports an intermittent document-validation error while opening an uploaded project document, inspect `fusion://electronics-documents` and activate the schematic or board document directly. The linked documents may still be valid even when the project wrapper reports a Fusion-side validation issue.
 
 ## References
 

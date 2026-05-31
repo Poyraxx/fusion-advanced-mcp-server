@@ -4,6 +4,11 @@ import adsk.core
 import adsk.cam
 import adsk.drawing
 import adsk.fusion
+try:
+    import adsk.electron
+    HAS_ELECTRON_API = True
+except Exception:
+    HAS_ELECTRON_API = False
 import os
 import sys
 import traceback
@@ -44,6 +49,13 @@ RESOURCE_URIS = [
     "fusion://components",
     "fusion://sketches",
     "fusion://bodies",
+    "fusion://electronics-context",
+    "fusion://electronics-schematic",
+    "fusion://electronics-board",
+    "fusion://electronics-library",
+    "fusion://electronics-libraries",
+    "fusion://electronics-documents",
+    "fusion://electronics-errors",
     "fusion://mcp-capabilities",
 ]
 
@@ -71,8 +83,19 @@ TOOL_METADATA = [
     {"name": "export_sketch_dxf", "description": "Export a sketch to a DXF file"},
     {"name": "export_design_file", "description": "Export the active design to STEP, IGES, SAT, STL, 3MF, or OBJ"},
     {"name": "export_active_drawing_pdf", "description": "Export the active drawing document to PDF"},
+    {"name": "create_electronics_sheet", "description": "Create a new sheet in the active electronics schematic"},
+    {"name": "begin_electronics_change", "description": "Begin an electronics design-change transaction for schematic, board, library, or design"},
+    {"name": "end_electronics_change", "description": "Commit the current electronics design-change transaction"},
+    {"name": "cancel_electronics_change", "description": "Cancel the current electronics design-change transaction"},
+    {"name": "list_electronics_documents", "description": "List open and available electronics schematic, board, project, and library documents"},
+    {"name": "upload_electronics_project", "description": "Upload schematic/board/library files into the active Fusion data folder and optionally open them"},
+    {"name": "open_electronics_document", "description": "Open an uploaded electronics schematic, board, library, or related project files by name"},
+    {"name": "activate_electronics_document", "description": "Activate an already open electronics schematic, board, library, or related project files by name"},
+    {"name": "export_electronics_file", "description": "Export the active electronics design as EAGLE SCH, BRD, or LBR"},
+    {"name": "execute_text_command", "description": "Run a Fusion text command directly through the active application"},
     {"name": "inspect_fusion_object", "description": "Inspect any live Fusion API object by Python path and list its members"},
     {"name": "execute_fusion_api", "description": "Execute arbitrary Python against the live Fusion API with design, drawing, and CAM context"},
+    {"name": "execute_electronics_api", "description": "Execute arbitrary Python against the live Fusion Electronics API with schematic, board, library, and design context"},
 ]
 
 PROMPT_METADATA = [
@@ -374,6 +397,13 @@ def safe_count(collection):
             return 0
 
 
+def safe_getattr(value, name, default=None):
+    try:
+        return getattr(value, name)
+    except Exception:
+        return default
+
+
 def safe_get_name(entity):
     try:
         return entity.name
@@ -393,6 +423,183 @@ def safe_entity_token(entity):
         return entity.entityToken
     except Exception:
         return ""
+
+
+def normalize_file_extension(extension):
+    return str(extension or "").strip().lower().lstrip(".")
+
+
+def get_data_file(entity):
+    try:
+        if safe_object_type(entity) == "adsk::core::Document":
+            return entity.dataFile
+        return entity
+    except Exception:
+        return None
+
+
+def get_data_file_name(entity):
+    data_file = get_data_file(entity)
+    return safe_get_name(data_file)
+
+
+def get_data_file_extension(entity):
+    data_file = get_data_file(entity)
+    return normalize_file_extension(safe_getattr(data_file, "fileExtension", ""))
+
+
+def get_document_base_name(doc):
+    return get_data_file_name(doc) or safe_get_name(doc)
+
+
+def get_document_active_product(doc):
+    if not doc:
+        return None
+
+    try:
+        products = doc.products
+    except Exception:
+        products = None
+
+    if not products:
+        return None
+
+    try:
+        active_product = products.activeProduct
+        if active_product:
+            return active_product
+    except Exception:
+        pass
+
+    try:
+        if products.count:
+            return products.item(0)
+    except Exception:
+        pass
+
+    return None
+
+
+def iter_open_documents():
+    try:
+        documents = app.documents
+    except Exception:
+        return
+
+    if not documents:
+        return
+
+    try:
+        count = documents.count
+    except Exception:
+        count = 0
+
+    for index in range(count):
+        try:
+            document = documents.item(index)
+        except Exception:
+            document = None
+        if document:
+            yield document
+
+
+def find_open_document(base_name="", extensions=None):
+    normalized_name = normalize_key(base_name) if not is_blank(base_name) else ""
+    normalized_extensions = None
+    if extensions:
+        normalized_extensions = {
+            normalize_file_extension(extension)
+            for extension in extensions
+            if not is_blank(extension)
+        }
+
+    for document in iter_open_documents():
+        if normalized_name and normalize_key(get_document_base_name(document)) != normalized_name:
+            continue
+
+        if normalized_extensions is not None:
+            document_extension = get_data_file_extension(document)
+            if document_extension not in normalized_extensions:
+                continue
+
+        return document
+
+    return None
+
+
+def get_active_data_folder():
+    try:
+        return app.data.activeFolder
+    except Exception:
+        return None
+
+
+def get_matching_data_files(base_name="", extensions=None, folder=None):
+    data_folder = folder or get_active_data_folder()
+    if not data_folder:
+        return []
+
+    data_files = safe_getattr(data_folder, "dataFiles")
+    if not data_files:
+        return []
+
+    normalized_name = normalize_key(base_name) if not is_blank(base_name) else ""
+    normalized_extensions = None
+    if extensions:
+        normalized_extensions = {
+            normalize_file_extension(extension)
+            for extension in extensions
+            if not is_blank(extension)
+        }
+
+    matches = []
+    for data_file in iter_collection(data_files):
+        if normalized_name and normalize_key(get_data_file_name(data_file)) != normalized_name:
+            continue
+
+        if normalized_extensions is not None:
+            if get_data_file_extension(data_file) not in normalized_extensions:
+                continue
+
+        matches.append(data_file)
+
+    return matches
+
+
+def get_document_summary(doc):
+    active_document = safe_getattr(app, "activeDocument")
+    data_file = get_data_file(doc)
+    active_product = get_document_active_product(doc)
+
+    summary = {
+        "name": safe_get_name(doc),
+        "object_type": safe_object_type(doc),
+        "is_active": bool(active_document and doc == active_document),
+        "is_saved": safe_getattr(doc, "isSaved"),
+        "base_name": get_document_base_name(doc),
+        "file_extension": get_data_file_extension(doc),
+        "data_file_id": safe_getattr(data_file, "id"),
+        "product_type": safe_getattr(active_product, "productType"),
+        "product_object_type": safe_object_type(active_product) if active_product else None,
+    }
+
+    if HAS_ELECTRON_API and active_product:
+        summary["electronics"] = serialize_electronics_document_summary(active_product)
+
+    return summary
+
+
+def get_data_file_summary(data_file):
+    return {
+        "name": get_data_file_name(data_file),
+        "extension": get_data_file_extension(data_file),
+        "id": safe_getattr(data_file, "id"),
+        "complete": safe_getattr(data_file, "isComplete"),
+        "read_only": safe_getattr(data_file, "isReadOnly"),
+        "in_use": safe_getattr(data_file, "isInUse"),
+        "version": safe_getattr(data_file, "versionNumber"),
+        "latest_version": safe_getattr(data_file, "latestVersionNumber"),
+    }
 
 
 def get_sketch_points_collection(sketch):
@@ -645,10 +852,13 @@ def get_active_products_context():
     active_product = None
 
     if doc:
-        try:
-            active_product = doc.products.activeProduct
-        except Exception:
-            active_product = None
+        active_product = get_document_active_product(doc)
+
+        if not active_product:
+            try:
+                active_product = app.activeProduct
+            except Exception:
+                active_product = None
 
         try:
             drawing_product = doc.products.itemByProductType("DrawingProductType")
@@ -664,6 +874,8 @@ def get_active_products_context():
         except Exception:
             cam = None
 
+    electronics_context = get_active_electronics_context(doc, active_product)
+
     return {
         "doc": doc,
         "design": design,
@@ -671,6 +883,154 @@ def get_active_products_context():
         "drawing": drawing,
         "cam": cam,
         "active_product": active_product,
+        "document_products": electronics_context["document_products"],
+        "ecad_document": electronics_context["ecad_document"],
+        "ecad_design": electronics_context["ecad_design"],
+        "schematic": electronics_context["schematic"],
+        "board": electronics_context["board"],
+        "library": electronics_context["library"],
+    }
+
+
+def iter_document_products(doc):
+    if not doc:
+        return []
+
+    try:
+        products = doc.products
+    except Exception:
+        return []
+
+    if not products:
+        return []
+
+    result = []
+    try:
+        count = products.count
+    except Exception:
+        count = 0
+
+    for index in range(count):
+        try:
+            product = products.item(index)
+        except Exception:
+            continue
+        if product:
+            result.append(product)
+    return result
+
+
+def safe_electron_cast(caster, value):
+    if not HAS_ELECTRON_API or not value:
+        return None
+    try:
+        return caster(value)
+    except Exception:
+        return None
+
+
+def first_electronics_product(products, caster):
+    for product in products:
+        cast_value = safe_electron_cast(caster, product)
+        if cast_value:
+            return cast_value
+    return None
+
+
+def get_active_electronics_context(doc=None, active_product=None):
+    products = iter_document_products(doc)
+    active = active_product
+    if not active:
+        try:
+            active = app.activeProduct
+        except Exception:
+            active = None
+
+    ecad_document = safe_electron_cast(adsk.electron.EcadDocument.cast, active) if HAS_ELECTRON_API else None
+    ecad_design = safe_electron_cast(adsk.electron.EcadDesign.cast, active) if HAS_ELECTRON_API else None
+    schematic = safe_electron_cast(adsk.electron.Schematic.cast, active) if HAS_ELECTRON_API else None
+    board = safe_electron_cast(adsk.electron.Board.cast, active) if HAS_ELECTRON_API else None
+    library = safe_electron_cast(adsk.electron.Library.cast, active) if HAS_ELECTRON_API else None
+
+    if HAS_ELECTRON_API:
+        ecad_document = ecad_document or first_electronics_product(products, adsk.electron.EcadDocument.cast)
+        ecad_design = ecad_design or first_electronics_product(products, adsk.electron.EcadDesign.cast)
+        schematic = schematic or first_electronics_product(products, adsk.electron.Schematic.cast)
+        board = board or first_electronics_product(products, adsk.electron.Board.cast)
+        library = library or first_electronics_product(products, adsk.electron.Library.cast)
+
+    base_name = get_document_base_name(doc)
+    if HAS_ELECTRON_API and not is_blank(base_name):
+        if not schematic:
+            schematic_doc = find_open_document(base_name, ("fsch", "sch"))
+            if schematic_doc:
+                schematic = first_electronics_product(iter_document_products(schematic_doc), adsk.electron.Schematic.cast)
+
+        if not board:
+            board_doc = find_open_document(base_name, ("fbrd", "brd"))
+            if board_doc:
+                board = first_electronics_product(iter_document_products(board_doc), adsk.electron.Board.cast)
+
+        if not library:
+            library_doc = find_open_document(base_name, ("flbr", "lbr"))
+            if library_doc:
+                library = first_electronics_product(iter_document_products(library_doc), adsk.electron.Library.cast)
+
+        if not ecad_design:
+            project_doc = find_open_document(base_name, ("fprj", "prj"))
+            if project_doc:
+                ecad_design = first_electronics_product(iter_document_products(project_doc), adsk.electron.EcadDesign.cast)
+                ecad_document = ecad_document or first_electronics_product(iter_document_products(project_doc), adsk.electron.EcadDocument.cast)
+
+    if schematic and not board:
+        try:
+            board = schematic.linkedBoard
+        except Exception:
+            board = None
+
+    if board and not schematic:
+        try:
+            schematic = board.linkedSchematic
+        except Exception:
+            schematic = None
+
+    if ecad_design:
+        try:
+            schematic = schematic or ecad_design.schematic
+        except Exception:
+            pass
+        try:
+            board = board or ecad_design.board
+        except Exception:
+            pass
+
+    if not ecad_design:
+        try:
+            if schematic and schematic.parentDesign:
+                ecad_design = schematic.parentDesign
+        except Exception:
+            pass
+        try:
+            if board and board.parentDesign:
+                ecad_design = board.parentDesign
+        except Exception:
+            pass
+        try:
+            if library and library.parentDesign:
+                ecad_design = library.parentDesign
+        except Exception:
+            pass
+
+    if not ecad_document:
+        ecad_document = ecad_design or schematic or board or library
+
+    return {
+        "document_products": products,
+        "ecad_document": ecad_document,
+        "ecad_design": ecad_design,
+        "schematic": schematic,
+        "board": board,
+        "library": library,
     }
 
 
@@ -1159,6 +1519,379 @@ def serialize_dimension(dimension):
     return data
 
 
+def serialize_workspace_list(workspaces, max_items=20):
+    items = []
+    if not workspaces:
+        return items
+
+    for index, workspace in enumerate(iter_collection(workspaces)):
+        if index >= max_items:
+            items.append({"__truncated__": max(0, safe_count(workspaces) - max_items)})
+            break
+        items.append(
+            {
+                "id": getattr(workspace, "id", None),
+                "name": safe_get_name(workspace),
+                "object_type": safe_object_type(workspace),
+            }
+        )
+    return items
+
+
+def preview_serialized_items(collection, serializer, limit=10):
+    items = []
+    if not collection:
+        return items
+
+    for index, item in enumerate(iter_collection(collection)):
+        if index >= limit:
+            break
+        items.append(serializer(item))
+    return items
+
+
+def serialize_electronics_error(error):
+    if not error:
+        return None
+    return {
+        "id": safe_getattr(error, "id"),
+        "code": safe_getattr(error, "code"),
+        "description": safe_getattr(error, "description"),
+        "module_name": safe_getattr(error, "moduleName"),
+        "sheet": safe_getattr(error, "sheet"),
+        "layer": safe_getattr(error, "layer"),
+        "error_type": safe_repr(safe_getattr(error, "errorType")),
+        "state": safe_repr(safe_getattr(error, "state")),
+        "signature": safe_getattr(error, "signature"),
+        "x": safe_getattr(error, "x"),
+        "y": safe_getattr(error, "y"),
+    }
+
+
+def serialize_electronics_sheet(sheet):
+    if not sheet:
+        return None
+    return {
+        "name": safe_get_name(sheet),
+        "object_type": safe_object_type(sheet),
+        "parts_count": safe_count(safe_getattr(sheet, "parts")),
+        "nets_count": safe_count(safe_getattr(sheet, "nets")),
+        "wires_count": safe_count(safe_getattr(sheet, "wires")),
+        "frames_count": safe_count(safe_getattr(sheet, "frames")),
+    }
+
+
+def serialize_electronics_part(part):
+    if not part:
+        return None
+
+    device = safe_getattr(part, "device")
+    device_set = safe_getattr(part, "deviceset")
+    package3d = safe_getattr(part, "package3d")
+    return {
+        "name": safe_get_name(part),
+        "object_type": safe_object_type(part),
+        "value": safe_getattr(part, "value"),
+        "device": safe_get_name(device),
+        "device_set": safe_get_name(device_set),
+        "package3d": safe_get_name(package3d),
+        "instance_count": safe_count(safe_getattr(part, "instances")),
+    }
+
+
+def serialize_electronics_net(net):
+    if not net:
+        return None
+
+    net_class = safe_getattr(net, "netClass")
+    return {
+        "name": safe_get_name(net),
+        "object_type": safe_object_type(net),
+        "class": safe_get_name(net_class),
+        "pin_ref_count": safe_count(safe_getattr(net, "pinRefs")),
+        "port_ref_count": safe_count(safe_getattr(net, "portRefs")),
+        "segment_count": safe_count(safe_getattr(net, "segments")),
+        "row_range": safe_getattr(net, "rowRange"),
+        "column_range": safe_getattr(net, "columnRange"),
+    }
+
+
+def serialize_electronics_element(element):
+    if not element:
+        return None
+
+    package = safe_getattr(element, "package")
+    return {
+        "name": safe_get_name(element),
+        "object_type": safe_object_type(element),
+        "value": safe_getattr(element, "value"),
+        "x": safe_getattr(element, "x"),
+        "y": safe_getattr(element, "y"),
+        "angle": safe_getattr(element, "angle"),
+        "mirror": safe_getattr(element, "mirror"),
+        "locked": safe_getattr(element, "locked"),
+        "populate": safe_getattr(element, "populate"),
+        "package": safe_get_name(package),
+    }
+
+
+def serialize_electronics_signal(signal):
+    if not signal:
+        return None
+
+    net_class = safe_getattr(signal, "netClass")
+    return {
+        "name": safe_get_name(signal),
+        "object_type": safe_object_type(signal),
+        "class": safe_get_name(net_class),
+        "wire_count": safe_count(safe_getattr(signal, "wires")),
+        "via_count": safe_count(safe_getattr(signal, "vias")),
+        "contact_ref_count": safe_count(safe_getattr(signal, "contactRefs")),
+        "air_wires_hidden": safe_getattr(signal, "airWiresHidden"),
+    }
+
+
+def serialize_electronics_device(device):
+    if not device:
+        return None
+
+    package = safe_getattr(device, "package")
+    return {
+        "name": safe_get_name(device),
+        "object_type": safe_object_type(device),
+        "library": safe_getattr(device, "library"),
+        "prefix": safe_getattr(device, "prefix"),
+        "value": safe_getattr(device, "value"),
+        "package": safe_get_name(package),
+        "gate_count": safe_count(safe_getattr(device, "gates")),
+        "package3d_count": safe_count(safe_getattr(device, "packages3d")),
+    }
+
+
+def serialize_electronics_device_set(device_set):
+    if not device_set:
+        return None
+
+    return {
+        "name": safe_get_name(device_set),
+        "object_type": safe_object_type(device_set),
+        "library": safe_getattr(device_set, "library"),
+        "prefix": safe_getattr(device_set, "prefix"),
+        "user_value": safe_getattr(device_set, "userValue"),
+        "locally_modified": safe_getattr(device_set, "locallyModified"),
+        "library_locally_modified": safe_getattr(device_set, "libraryLocallyModified"),
+        "gate_count": safe_count(safe_getattr(device_set, "gates")),
+        "device_count": safe_count(safe_getattr(device_set, "devices")),
+    }
+
+
+def serialize_electronics_library(library):
+    if not library:
+        return None
+
+    return {
+        "name": safe_get_name(library),
+        "object_type": safe_object_type(library),
+        "product_type": safe_getattr(library, "productType"),
+        "id": safe_getattr(library, "id"),
+        "editable": safe_getattr(library, "editable"),
+        "description": safe_getattr(library, "description"),
+        "symbol_count": safe_count(safe_getattr(library, "symbols")),
+        "package_count": safe_count(safe_getattr(library, "packages")),
+        "package3d_count": safe_count(safe_getattr(library, "packages3d")),
+        "device_set_count": safe_count(safe_getattr(library, "deviceSets")),
+        "device_count": safe_count(safe_getattr(library, "devices")),
+        "workspaces": serialize_workspace_list(safe_getattr(library, "workspaces"), 10),
+        "symbols_preview": preview_serialized_items(safe_getattr(library, "symbols"), lambda item: serialize_adsk_object(item, 1, 2, 6), 6),
+        "packages_preview": preview_serialized_items(safe_getattr(library, "packages"), lambda item: serialize_adsk_object(item, 1, 2, 6), 6),
+        "device_sets_preview": preview_serialized_items(safe_getattr(library, "deviceSets"), serialize_electronics_device_set, 6),
+        "devices_preview": preview_serialized_items(safe_getattr(library, "devices"), serialize_electronics_device, 6),
+    }
+
+
+def serialize_electronics_library_summary(library):
+    if not library:
+        return None
+
+    return {
+        "name": safe_get_name(library),
+        "object_type": safe_object_type(library),
+        "product_type": safe_getattr(library, "productType"),
+        "id": safe_getattr(library, "id"),
+        "editable": safe_getattr(library, "editable"),
+        "description": safe_getattr(library, "description"),
+        "symbol_count": safe_count(safe_getattr(library, "symbols")),
+        "package_count": safe_count(safe_getattr(library, "packages")),
+        "package3d_count": safe_count(safe_getattr(library, "packages3d")),
+        "device_set_count": safe_count(safe_getattr(library, "deviceSets")),
+        "device_count": safe_count(safe_getattr(library, "devices")),
+    }
+
+
+def serialize_electronics_board(board):
+    if not board:
+        return None
+
+    linked_schematic = safe_getattr(board, "linkedSchematic")
+    return {
+        "name": safe_get_name(board),
+        "object_type": safe_object_type(board),
+        "product_type": safe_getattr(board, "productType"),
+        "linked_schematic": safe_get_name(linked_schematic),
+        "checked": safe_getattr(board, "checked"),
+        "element_count": safe_count(safe_getattr(board, "elements")),
+        "signal_count": safe_count(safe_getattr(board, "signals")),
+        "wire_count": safe_count(safe_getattr(board, "wires")),
+        "hole_count": safe_count(safe_getattr(board, "holes")),
+        "class_count": safe_count(safe_getattr(board, "classes")),
+        "error_count": safe_count(safe_getattr(board, "errors")),
+        "library_count": safe_count(safe_getattr(board, "libraries")),
+        "workspaces": serialize_workspace_list(safe_getattr(board, "workspaces"), 10),
+        "elements_preview": preview_serialized_items(safe_getattr(board, "elements"), serialize_electronics_element, 12),
+        "signals_preview": preview_serialized_items(safe_getattr(board, "signals"), serialize_electronics_signal, 12),
+        "errors_preview": preview_serialized_items(safe_getattr(board, "errors"), serialize_electronics_error, 12),
+        "libraries_preview": preview_serialized_items(safe_getattr(board, "libraries"), serialize_electronics_library, 8),
+    }
+
+
+def serialize_electronics_board_summary(board):
+    if not board:
+        return None
+
+    linked_schematic = safe_getattr(board, "linkedSchematic")
+    return {
+        "name": safe_get_name(board),
+        "object_type": safe_object_type(board),
+        "product_type": safe_getattr(board, "productType"),
+        "linked_schematic": safe_get_name(linked_schematic),
+        "checked": safe_getattr(board, "checked"),
+        "element_count": safe_count(safe_getattr(board, "elements")),
+        "signal_count": safe_count(safe_getattr(board, "signals")),
+        "wire_count": safe_count(safe_getattr(board, "wires")),
+        "hole_count": safe_count(safe_getattr(board, "holes")),
+        "class_count": safe_count(safe_getattr(board, "classes")),
+        "error_count": safe_count(safe_getattr(board, "errors")),
+        "library_count": safe_count(safe_getattr(board, "libraries")),
+    }
+
+
+def serialize_electronics_schematic(schematic):
+    if not schematic:
+        return None
+
+    linked_board = safe_getattr(schematic, "linkedBoard")
+    return {
+        "name": safe_get_name(schematic),
+        "object_type": safe_object_type(schematic),
+        "product_type": safe_getattr(schematic, "productType"),
+        "linked_board": safe_get_name(linked_board),
+        "checked": safe_getattr(schematic, "checked"),
+        "sheet_count": safe_count(safe_getattr(schematic, "sheets")),
+        "part_count": safe_count(safe_getattr(schematic, "parts")),
+        "net_count": safe_count(safe_getattr(schematic, "nets")),
+        "module_count": safe_count(safe_getattr(schematic, "modules")),
+        "class_count": safe_count(safe_getattr(schematic, "classes")),
+        "error_count": safe_count(safe_getattr(schematic, "errors")),
+        "library_count": safe_count(safe_getattr(schematic, "libraries")),
+        "workspaces": serialize_workspace_list(safe_getattr(schematic, "workspaces"), 10),
+        "sheets_preview": preview_serialized_items(safe_getattr(schematic, "sheets"), serialize_electronics_sheet, 12),
+        "parts_preview": preview_serialized_items(safe_getattr(schematic, "parts"), serialize_electronics_part, 12),
+        "nets_preview": preview_serialized_items(safe_getattr(schematic, "nets"), serialize_electronics_net, 12),
+        "errors_preview": preview_serialized_items(safe_getattr(schematic, "errors"), serialize_electronics_error, 12),
+        "libraries_preview": preview_serialized_items(safe_getattr(schematic, "libraries"), serialize_electronics_library, 8),
+    }
+
+
+def serialize_electronics_schematic_summary(schematic):
+    if not schematic:
+        return None
+
+    linked_board = safe_getattr(schematic, "linkedBoard")
+    return {
+        "name": safe_get_name(schematic),
+        "object_type": safe_object_type(schematic),
+        "product_type": safe_getattr(schematic, "productType"),
+        "linked_board": safe_get_name(linked_board),
+        "checked": safe_getattr(schematic, "checked"),
+        "sheet_count": safe_count(safe_getattr(schematic, "sheets")),
+        "part_count": safe_count(safe_getattr(schematic, "parts")),
+        "net_count": safe_count(safe_getattr(schematic, "nets")),
+        "module_count": safe_count(safe_getattr(schematic, "modules")),
+        "class_count": safe_count(safe_getattr(schematic, "classes")),
+        "error_count": safe_count(safe_getattr(schematic, "errors")),
+        "library_count": safe_count(safe_getattr(schematic, "libraries")),
+        "sheets_preview": preview_serialized_items(safe_getattr(schematic, "sheets"), serialize_electronics_sheet, 6),
+    }
+
+
+def serialize_electronics_design(ecad_design):
+    if not ecad_design:
+        return None
+
+    schematic = safe_getattr(ecad_design, "schematic")
+    board = safe_getattr(ecad_design, "board")
+    return {
+        "name": safe_get_name(ecad_design),
+        "object_type": safe_object_type(ecad_design),
+        "product_type": safe_getattr(ecad_design, "productType"),
+        "schematic": safe_get_name(schematic),
+        "board": safe_get_name(board),
+        "workspaces": serialize_workspace_list(safe_getattr(ecad_design, "workspaces"), 10),
+    }
+
+
+def serialize_electronics_design_summary(ecad_design):
+    if not ecad_design:
+        return None
+
+    schematic = safe_getattr(ecad_design, "schematic")
+    board = safe_getattr(ecad_design, "board")
+    return {
+        "name": safe_get_name(ecad_design),
+        "object_type": safe_object_type(ecad_design),
+        "product_type": safe_getattr(ecad_design, "productType"),
+        "schematic": safe_get_name(schematic),
+        "board": safe_get_name(board),
+        "has_schematic": bool(schematic),
+        "has_board": bool(board),
+    }
+
+
+def serialize_electronics_document_summary(document):
+    if not document or not HAS_ELECTRON_API:
+        return None
+
+    ecad_design = safe_electron_cast(adsk.electron.EcadDesign.cast, document)
+    if ecad_design:
+        data = serialize_electronics_design_summary(ecad_design)
+        data["entity_type"] = "EcadDesign"
+        return data
+
+    schematic = safe_electron_cast(adsk.electron.Schematic.cast, document)
+    if schematic:
+        data = serialize_electronics_schematic_summary(schematic)
+        data["entity_type"] = "Schematic"
+        return data
+
+    board = safe_electron_cast(adsk.electron.Board.cast, document)
+    if board:
+        data = serialize_electronics_board_summary(board)
+        data["entity_type"] = "Board"
+        return data
+
+    library = safe_electron_cast(adsk.electron.Library.cast, document)
+    if library:
+        data = serialize_electronics_library_summary(library)
+        data["entity_type"] = "Library"
+        return data
+
+    return {
+        "name": safe_get_name(document),
+        "object_type": safe_object_type(document),
+        "product_type": safe_getattr(document, "productType"),
+    }
+
+
 def is_adsk_like(value):
     module_name = getattr(type(value), "__module__", "")
     return module_name.startswith("adsk") or hasattr(value, "objectType")
@@ -1230,6 +1963,79 @@ def serialize_adsk_object(value, depth=0, max_depth=3, max_items=10):
     sketch_entity = adsk.fusion.SketchEntity.cast(value)
     if sketch_entity:
         return serialize_sketch_entity(sketch_entity)
+
+    if HAS_ELECTRON_API:
+        ecad_design = adsk.electron.EcadDesign.cast(value)
+        if ecad_design:
+            data = serialize_electronics_design(ecad_design)
+            data["entity_type"] = "EcadDesign"
+            return data
+
+        schematic = adsk.electron.Schematic.cast(value)
+        if schematic:
+            data = serialize_electronics_schematic(schematic)
+            data["entity_type"] = "Schematic"
+            return data
+
+        board = adsk.electron.Board.cast(value)
+        if board:
+            data = serialize_electronics_board(board)
+            data["entity_type"] = "Board"
+            return data
+
+        library = adsk.electron.Library.cast(value)
+        if library:
+            data = serialize_electronics_library(library)
+            data["entity_type"] = "Library"
+            return data
+
+        sheet = adsk.electron.Sheet.cast(value)
+        if sheet:
+            data = serialize_electronics_sheet(sheet)
+            data["entity_type"] = "Sheet"
+            return data
+
+        part = adsk.electron.Part.cast(value)
+        if part:
+            data = serialize_electronics_part(part)
+            data["entity_type"] = "Part"
+            return data
+
+        net = adsk.electron.Net.cast(value)
+        if net:
+            data = serialize_electronics_net(net)
+            data["entity_type"] = "Net"
+            return data
+
+        element = adsk.electron.Element.cast(value)
+        if element:
+            data = serialize_electronics_element(element)
+            data["entity_type"] = "Element"
+            return data
+
+        signal = adsk.electron.Signal.cast(value)
+        if signal:
+            data = serialize_electronics_signal(signal)
+            data["entity_type"] = "Signal"
+            return data
+
+        device = adsk.electron.Device.cast(value)
+        if device:
+            data = serialize_electronics_device(device)
+            data["entity_type"] = "Device"
+            return data
+
+        device_set = adsk.electron.DeviceSet.cast(value)
+        if device_set:
+            data = serialize_electronics_device_set(device_set)
+            data["entity_type"] = "DeviceSet"
+            return data
+
+        electron_error = adsk.electron.Error.cast(value)
+        if electron_error:
+            data = serialize_electronics_error(electron_error)
+            data["entity_type"] = "ElectronicsError"
+            return data
 
     data = {
         "python_type": type(value).__name__,
@@ -1309,11 +2115,14 @@ def make_jsonable(value, depth=0, max_depth=3, max_items=10):
 
 def build_script_builtins(print_fn):
     return {
+        "__import__": __import__,
         "abs": abs,
         "all": all,
         "any": any,
         "bool": bool,
+        "callable": callable,
         "dict": dict,
+        "dir": dir,
         "enumerate": enumerate,
         "Exception": Exception,
         "filter": filter,
@@ -1356,6 +2165,13 @@ def build_fusion_script_context(input_data=None, print_fn=None):
     design = products["design"]
     drawing = products["drawing"]
     cam = products["cam"]
+    ecad_document = products["ecad_document"]
+    ecad_design = products["ecad_design"]
+    schematic = products["schematic"]
+    board = products["board"]
+    library = products["library"]
+    active_product = products["active_product"] or ecad_document or design or drawing or cam
+    document_products = products["document_products"]
     selected_entities = get_selected_entities()
     exports_dir = ensure_dir((REPO_ROOT or ADDIN_DIR) / "exports")
     printer = print_fn or (lambda *args, **kwargs: None)
@@ -1388,17 +2204,50 @@ def build_fusion_script_context(input_data=None, print_fn=None):
             return adsk.core.ValueInput.createByString(str(value))
         return angle_value_input(design, value, unit)
 
+    def execute_text_command_local(command):
+        if is_blank(command):
+            raise ValueError("command is required")
+        return app.executeTextCommand(str(command))
+
+    def require_ecad_document():
+        if not ecad_document:
+            raise RuntimeError("Active document is not an electronics document")
+        return ecad_document
+
+    def begin_design_change_local(change_id=""):
+        target = require_ecad_document()
+        target.beginDesignChange(str(change_id or "MCP Electronics Change"))
+        return True
+
+    def end_design_change_local():
+        target = require_ecad_document()
+        target.endDesignChange()
+        return True
+
+    def cancel_design_change_local():
+        target = require_ecad_document()
+        target.cancelDesignChange()
+        return True
+
     return {
         "adsk": adsk,
         "app": app,
         "ui": ui,
         "doc": doc,
         "document": doc,
-        "active_product": products["active_product"],
+        "active_product": active_product,
         "design": design,
         "design_error": products["design_error"],
         "drawing": drawing,
         "cam": cam,
+        "ecad_document": ecad_document,
+        "ecad_design": ecad_design,
+        "electronics_document": ecad_document,
+        "electronics_design": ecad_design,
+        "schematic": schematic,
+        "board": board,
+        "library": library,
+        "document_products": document_products,
         "root_component": design.rootComponent if design else None,
         "selected_entities": selected_entities,
         "selected_tokens": [safe_entity_token(entity) for entity in selected_entities],
@@ -1438,6 +2287,11 @@ def build_fusion_script_context(input_data=None, print_fn=None):
         "occurrence_for": (lambda component: find_occurrence_for_component(design, component)) if design else (lambda component: None),
         "entity_token": safe_entity_token,
         "entity_name": safe_get_name,
+        "execute_text_command": execute_text_command_local,
+        "text_command": execute_text_command_local,
+        "begin_design_change": begin_design_change_local,
+        "end_design_change": end_design_change_local,
+        "cancel_design_change": cancel_design_change_local,
     }
 
 
@@ -1504,6 +2358,10 @@ def execute_fusion_api_impl(script="", expression="", input_data=None, result_va
         if not is_blank(script):
             code = compile(str(script), "<fusion_mcp>", "exec")
             exec(code, namespace, namespace)
+
+        # Give Fusion a brief chance to settle after scripts that open documents,
+        # switch products, or trigger asynchronous UI/model updates.
+        settle_fusion_processing(cycles=10, delay_seconds=0.1)
 
         raw_result = namespace.get(result_variable)
         SCRIPT_STATE["last_result"] = raw_result
@@ -1582,6 +2440,150 @@ def get_bodies_resource():
         return error_payload("Error reading bodies", exc)
 
 
+def get_electronics_target_context():
+    products = get_active_products_context()
+    return {
+        "ecad_document": products["ecad_document"],
+        "ecad_design": products["ecad_design"],
+        "schematic": products["schematic"],
+        "board": products["board"],
+        "library": products["library"],
+        "document_products": products["document_products"],
+        "active_product": products["active_product"] or products["ecad_document"],
+    }
+
+
+def resolve_electronics_target_document(target="active"):
+    context = get_electronics_target_context()
+    key = normalize_key(target or "active")
+
+    if key in ("active", "document", "ecad", "electronics", "electronics_document"):
+        document = context["ecad_document"] or context["schematic"] or context["board"] or context["library"] or context["ecad_design"]
+    elif key in ("schematic", "sch"):
+        document = context["schematic"]
+    elif key in ("board", "brd", "pcb"):
+        document = context["board"]
+    elif key in ("library", "lbr"):
+        document = context["library"]
+    elif key in ("design", "ecad_design", "electronics_design"):
+        document = context["ecad_design"]
+    else:
+        raise ValueError(f"Unsupported electronics target: {target}")
+
+    if not document:
+        raise RuntimeError(f"No active electronics document available for target: {target}")
+    return document
+
+
+def get_electronics_context_resource():
+    try:
+        products = get_active_products_context()
+        context = {
+            "document_name": getattr(products["doc"], "name", None),
+            "active_product_type": safe_object_type(products["active_product"]),
+            "document_products": [
+                {
+                    "name": safe_get_name(product),
+                    "object_type": safe_object_type(product),
+                    "product_type": safe_getattr(product, "productType"),
+                }
+                for product in products["document_products"]
+            ],
+            # Keep this resource compact so recently opened electronics projects
+            # don't trigger deep object walks while Fusion is still settling.
+            "ecad_document": serialize_electronics_document_summary(products["ecad_document"]),
+            "ecad_design": serialize_electronics_design_summary(products["ecad_design"]),
+            "schematic": serialize_electronics_schematic_summary(products["schematic"]),
+            "board": serialize_electronics_board_summary(products["board"]),
+            "library": serialize_electronics_library_summary(products["library"]),
+        }
+        return context
+    except Exception as exc:
+        return error_payload("Error reading electronics context", exc)
+
+
+def get_electronics_schematic_resource():
+    try:
+        return {"schematic": serialize_electronics_schematic_summary(resolve_electronics_target_document("schematic"))}
+    except Exception as exc:
+        return error_payload("Error reading electronics schematic", exc)
+
+
+def get_electronics_board_resource():
+    try:
+        return {"board": serialize_electronics_board_summary(resolve_electronics_target_document("board"))}
+    except Exception as exc:
+        return error_payload("Error reading electronics board", exc)
+
+
+def get_electronics_library_resource():
+    try:
+        return {"library": serialize_electronics_library_summary(resolve_electronics_target_document("library"))}
+    except Exception as exc:
+        return error_payload("Error reading electronics library", exc)
+
+
+def get_electronics_libraries_resource():
+    try:
+        context = get_electronics_target_context()
+        libraries = []
+        if context["schematic"] and getattr(context["schematic"], "libraries", None):
+            libraries.extend(iter_collection(context["schematic"].libraries))
+        elif context["board"] and getattr(context["board"], "libraries", None):
+            libraries.extend(iter_collection(context["board"].libraries))
+        elif context["library"]:
+            libraries.append(context["library"])
+
+        return {
+            "libraries": [serialize_electronics_library_summary(library) for library in libraries]
+        }
+    except Exception as exc:
+        return error_payload("Error reading electronics libraries", exc)
+
+
+def get_electronics_documents_resource():
+    try:
+        active_folder = get_active_data_folder()
+        open_documents = [get_document_summary(document) for document in iter_open_documents()]
+        electronics_data_files = []
+        if active_folder:
+            for data_file in iter_collection(safe_getattr(active_folder, "dataFiles")):
+                extension = get_data_file_extension(data_file)
+                if extension in ("fsch", "fbrd", "fprj", "flbr", "sch", "brd", "lbr", "prj"):
+                    electronics_data_files.append(get_data_file_summary(data_file))
+
+        return {
+            "active_folder_name": safe_get_name(active_folder),
+            "active_folder_id": safe_getattr(active_folder, "id"),
+            "open_documents": open_documents,
+            "folder_data_files": electronics_data_files,
+        }
+    except Exception as exc:
+        return error_payload("Error reading electronics documents", exc)
+
+
+def get_electronics_errors_resource():
+    try:
+        context = get_electronics_target_context()
+        schematic_errors = []
+        board_errors = []
+
+        schematic = context["schematic"]
+        if schematic and getattr(schematic, "errors", None):
+            schematic_errors = [serialize_electronics_error(item) for item in iter_collection(schematic.errors)]
+
+        board = context["board"]
+        if board and getattr(board, "errors", None):
+            board_errors = [serialize_electronics_error(item) for item in iter_collection(board.errors)]
+
+        return {
+            "schematic_errors": schematic_errors,
+            "board_errors": board_errors,
+        }
+    except Exception as exc:
+        return error_payload("Error reading electronics errors", exc)
+
+
 def get_mcp_capabilities_resource():
     try:
         context_keys = sorted(build_fusion_script_context().keys())
@@ -1596,6 +2598,7 @@ def get_mcp_capabilities_resource():
                 "context_keys": context_keys,
                 "notes": [
                     "execute_fusion_api exposes design, drawing, cam, selection, and helper find_* functions.",
+                    "execute_electronics_api exposes ecad_document, ecad_design, schematic, board, library, and transaction helpers.",
                     "Use inspect_fusion_object with Python paths such as design.rootComponent.features or cam.setups.",
                     "Interactive UI commands may still need manual user interaction, but API coverage is no longer limited to the fixed tool list.",
                 ],
@@ -2292,6 +3295,356 @@ def export_active_drawing_pdf_impl(filename=""):
         return error_payload("Error exporting drawing PDF", exc)
 
 
+def create_electronics_sheet_impl(name=""):
+    schematic = resolve_electronics_target_document("schematic")
+    change_started = False
+    try:
+        schematic.beginDesignChange(f"Create sheet {name or ''}".strip())
+        change_started = True
+        sheet = schematic.sheets.create(name) if not is_blank(name) else schematic.sheets.create()
+        schematic.endDesignChange()
+        change_started = False
+        return {
+            "message": "Electronics sheet created successfully",
+            "sheet": serialize_electronics_sheet(sheet),
+            "schematic": serialize_electronics_schematic(schematic),
+        }
+    except Exception as exc:
+        if change_started:
+            try:
+                schematic.cancelDesignChange()
+            except Exception:
+                pass
+        return error_payload("Error creating electronics sheet", exc)
+
+
+def begin_electronics_change_impl(change_id="", target="active"):
+    try:
+        document = resolve_electronics_target_document(target)
+        document.beginDesignChange(str(change_id or "MCP Electronics Change"))
+        return {
+            "message": "Electronics design-change started",
+            "target": safe_get_name(document),
+            "object_type": safe_object_type(document),
+        }
+    except Exception as exc:
+        return error_payload("Error beginning electronics design change", exc)
+
+
+def end_electronics_change_impl(target="active"):
+    try:
+        document = resolve_electronics_target_document(target)
+        document.endDesignChange()
+        return {
+            "message": "Electronics design-change committed",
+            "target": safe_get_name(document),
+            "object_type": safe_object_type(document),
+        }
+    except Exception as exc:
+        return error_payload("Error ending electronics design change", exc)
+
+
+def cancel_electronics_change_impl(target="active"):
+    try:
+        document = resolve_electronics_target_document(target)
+        document.cancelDesignChange()
+        return {
+            "message": "Electronics design-change cancelled",
+            "target": safe_get_name(document),
+            "object_type": safe_object_type(document),
+        }
+    except Exception as exc:
+        return error_payload("Error cancelling electronics design change", exc)
+
+
+def resolve_electronics_target_extensions(target):
+    key = normalize_key(target or "active")
+    if key in ("schematic", "sch"):
+        return ("fsch", "sch")
+    if key in ("board", "brd", "pcb"):
+        return ("fbrd", "brd")
+    if key in ("library", "lbr"):
+        return ("flbr", "lbr")
+    if key in ("project", "design", "ecad_design", "electronics_design", "fprj", "prj"):
+        return ("fprj", "prj", "fsch", "sch", "fbrd", "brd")
+    if key in ("all", "related"):
+        return ("fsch", "sch", "fbrd", "brd", "fprj", "prj", "flbr", "lbr")
+    return ("fsch", "sch", "fbrd", "brd", "fprj", "prj", "flbr", "lbr")
+
+
+def open_data_file_if_needed(data_file):
+    target_id = safe_getattr(data_file, "id")
+    for document in iter_open_documents():
+        document_data_file = get_data_file(document)
+        if document_data_file and safe_getattr(document_data_file, "id") == target_id:
+            return document
+    return app.documents.open(data_file)
+
+
+def list_electronics_documents_impl():
+    try:
+        return get_electronics_documents_resource()
+    except Exception as exc:
+        return error_payload("Error listing electronics documents", exc)
+
+
+def open_electronics_document_impl(name, target="schematic", activate=True, open_related=False):
+    try:
+        if is_blank(name):
+            raise ValueError("name is required")
+
+        requested_extensions = resolve_electronics_target_extensions(target)
+        matching_data_files = get_matching_data_files(name, requested_extensions)
+        if not matching_data_files:
+            raise ValueError(f"Could not find uploaded electronics files for {name} with target {target}")
+
+        open_targets = list(matching_data_files)
+        preferred_extension_order = list(requested_extensions)
+        open_targets.sort(key=lambda item: preferred_extension_order.index(get_data_file_extension(item)) if get_data_file_extension(item) in preferred_extension_order else 999)
+
+        opened_documents = []
+        errors = []
+
+        for data_file in open_targets:
+            try:
+                document = open_data_file_if_needed(data_file)
+                if document:
+                    opened_documents.append(document)
+                    if not open_related:
+                        break
+            except Exception as exc:
+                errors.append({
+                    "name": get_data_file_name(data_file),
+                    "extension": get_data_file_extension(data_file),
+                    "error": str(exc),
+                })
+
+        if not opened_documents:
+            raise RuntimeError(f"Unable to open any electronics documents for {name}: {errors}")
+
+        activated_document = None
+        if activate:
+            preferred_extensions = list(requested_extensions)
+            opened_documents.sort(key=lambda document: preferred_extensions.index(get_data_file_extension(document)) if get_data_file_extension(document) in preferred_extensions else 999)
+            activated_document = opened_documents[0]
+            activated_document.activate()
+
+        settle_fusion_processing(cycles=12, delay_seconds=0.1)
+
+        return {
+            "message": "Electronics document opened successfully" if len(opened_documents) == 1 else "Electronics documents opened successfully",
+            "requested_name": name,
+            "target": target,
+            "opened_documents": [get_document_summary(document) for document in opened_documents],
+            "activated_document": get_document_summary(activated_document) if activated_document else None,
+            "errors": errors,
+        }
+    except Exception as exc:
+        return error_payload("Error opening electronics document", exc)
+
+
+def activate_electronics_document_impl(name, target="schematic"):
+    try:
+        if is_blank(name):
+            raise ValueError("name is required")
+
+        requested_extensions = resolve_electronics_target_extensions(target)
+        document = find_open_document(name, requested_extensions)
+        if not document:
+            return open_electronics_document_impl(name, target, True, False)
+
+        document.activate()
+        settle_fusion_processing(cycles=12, delay_seconds=0.1)
+
+        return {
+            "message": "Electronics document activated successfully",
+            "requested_name": name,
+            "target": target,
+            "document": get_document_summary(document),
+        }
+    except Exception as exc:
+        return error_payload("Error activating electronics document", exc)
+
+
+def upload_electronics_project_impl(schematic_path="", board_path="", library_paths=None, open_documents=True, activate_target="schematic"):
+    try:
+        library_paths = library_paths or []
+        input_paths = []
+
+        if not is_blank(schematic_path):
+            input_paths.append(Path(str(schematic_path)).expanduser())
+        if not is_blank(board_path):
+            input_paths.append(Path(str(board_path)).expanduser())
+
+        normalized_library_paths = []
+        for library_path in library_paths:
+            if is_blank(library_path):
+                continue
+            normalized_library_paths.append(Path(str(library_path)).expanduser())
+
+        if not input_paths and not normalized_library_paths:
+            raise ValueError("At least one schematic_path, board_path, or library_paths entry is required")
+
+        for path in input_paths + normalized_library_paths:
+            if not path.exists():
+                raise FileNotFoundError(f"Path does not exist: {path}")
+
+        folder = get_active_data_folder()
+        if not folder:
+            raise RuntimeError("No active Fusion data folder available")
+
+        project_base_name = ""
+        if input_paths:
+            project_base_name = input_paths[0].stem
+        elif normalized_library_paths:
+            project_base_name = normalized_library_paths[0].stem
+
+        upload_state_history = []
+        uploaded_files = []
+
+        if len(input_paths) > 1:
+            future = folder.uploadAssembly([str(path) for path in input_paths])
+            if not future:
+                raise RuntimeError("uploadAssembly returned null")
+
+            state_names = {
+                getattr(adsk.core.UploadStates, "UploadProcessing", None): "UploadProcessing",
+                getattr(adsk.core.UploadStates, "UploadFinished", None): "UploadFinished",
+                getattr(adsk.core.UploadStates, "UploadFailed", None): "UploadFailed",
+            }
+
+            for _ in range(480):
+                adsk.doEvents()
+                time.sleep(0.25)
+                upload_state = future.uploadState
+                state_name = state_names.get(upload_state, str(upload_state))
+                if not upload_state_history or upload_state_history[-1] != state_name:
+                    upload_state_history.append(state_name)
+                if upload_state == adsk.core.UploadStates.UploadFinished:
+                    break
+                if upload_state == adsk.core.UploadStates.UploadFailed:
+                    raise RuntimeError("uploadAssembly failed")
+            else:
+                raise RuntimeError("uploadAssembly timed out")
+        elif input_paths:
+            future = folder.uploadFile(str(input_paths[0]))
+            if not future:
+                raise RuntimeError("uploadFile returned null")
+
+            state_names = {
+                getattr(adsk.core.UploadStates, "UploadProcessing", None): "UploadProcessing",
+                getattr(adsk.core.UploadStates, "UploadFinished", None): "UploadFinished",
+                getattr(adsk.core.UploadStates, "UploadFailed", None): "UploadFailed",
+            }
+
+            for _ in range(480):
+                adsk.doEvents()
+                time.sleep(0.25)
+                upload_state = future.uploadState
+                state_name = state_names.get(upload_state, str(upload_state))
+                if not upload_state_history or upload_state_history[-1] != state_name:
+                    upload_state_history.append(state_name)
+                if upload_state == adsk.core.UploadStates.UploadFinished:
+                    break
+                if upload_state == adsk.core.UploadStates.UploadFailed:
+                    raise RuntimeError("uploadFile failed")
+            else:
+                raise RuntimeError("uploadFile timed out")
+
+        for library_path in normalized_library_paths:
+            future = folder.uploadFile(str(library_path))
+            if not future:
+                raise RuntimeError(f"uploadFile returned null for library: {library_path}")
+
+            for _ in range(480):
+                adsk.doEvents()
+                time.sleep(0.25)
+                if future.uploadState == adsk.core.UploadStates.UploadFinished:
+                    break
+                if future.uploadState == adsk.core.UploadStates.UploadFailed:
+                    raise RuntimeError(f"Library upload failed: {library_path}")
+            else:
+                raise RuntimeError(f"Library upload timed out: {library_path}")
+
+        settle_fusion_processing(cycles=12, delay_seconds=0.1)
+
+        for data_file in get_matching_data_files(project_base_name):
+            extension = get_data_file_extension(data_file)
+            if extension in ("fsch", "fbrd", "fprj", "flbr", "sch", "brd", "lbr", "prj"):
+                uploaded_files.append(get_data_file_summary(data_file))
+
+        open_result = None
+        if open_documents and not is_blank(project_base_name):
+            open_target = activate_target or "schematic"
+            open_related = bool(not is_blank(board_path) or len(input_paths) > 1)
+            open_result = open_electronics_document_impl(project_base_name, open_target, True, open_related)
+
+        return {
+            "message": "Electronics project uploaded successfully",
+            "project_name": project_base_name,
+            "active_folder_name": safe_get_name(folder),
+            "upload_state_history": upload_state_history,
+            "uploaded_files": uploaded_files,
+            "open_result": open_result,
+        }
+    except Exception as exc:
+        return error_payload("Error uploading electronics project", exc)
+
+
+def export_electronics_file_impl(format, filename="", target="active"):
+    try:
+        format_key = normalize_key(format)
+        if format_key in ("sch", "eagle_sch", "schematic"):
+            schematic = resolve_electronics_target_document("schematic")
+            output_path = resolve_output_path(filename, f"{safe_get_name(schematic)}_schematic", ".sch")
+            export_options = schematic.exportManager.createEagleSchExportOptions(str(output_path))
+            success = schematic.exportManager.execute(export_options)
+            return {"message": "Electronics schematic export completed" if success else "Electronics schematic export failed", "success": success, "format": "sch", "path": str(output_path)}
+
+        if format_key in ("brd", "eagle_brd", "board", "pcb"):
+            board = resolve_electronics_target_document("board")
+            output_path = resolve_output_path(filename, f"{safe_get_name(board)}_board", ".brd")
+            export_options = board.exportManager.createEagleBrdExportOptions(str(output_path))
+            success = board.exportManager.execute(export_options)
+            return {"message": "Electronics board export completed" if success else "Electronics board export failed", "success": success, "format": "brd", "path": str(output_path)}
+
+        if format_key in ("lbr", "eagle_lbr", "library"):
+            library = resolve_electronics_target_document("library")
+            output_path = resolve_output_path(filename, f"{safe_get_name(library)}_library", ".lbr")
+            export_options = library.exportManager.createEagleLbrExportOptions(str(output_path))
+            success = library.exportManager.execute(export_options)
+            return {"message": "Electronics library export completed" if success else "Electronics library export failed", "success": success, "format": "lbr", "path": str(output_path)}
+
+        raise ValueError(f"Unsupported electronics export format: {format}")
+    except Exception as exc:
+        return error_payload("Error exporting electronics file", exc)
+
+
+def execute_text_command_impl(command):
+    try:
+        if is_blank(command):
+            raise ValueError("command is required")
+        result = app.executeTextCommand(str(command))
+        return {
+            "message": "Text command executed",
+            "command": command,
+            "result": result,
+        }
+    except Exception as exc:
+        return error_payload("Error executing text command", exc)
+
+
+def execute_electronics_api_impl(script="", expression="", input_data=None, result_variable="result"):
+    try:
+        context = get_active_products_context()
+        if not context["ecad_document"] and not context["schematic"] and not context["board"] and not context["library"] and not context["ecad_design"]:
+            raise RuntimeError("Active document is not an electronics document")
+    except Exception as exc:
+        return error_payload("execute_electronics_api failed", exc)
+
+    return execute_fusion_api_impl(script, expression, input_data, result_variable)
+
+
 def create_sketch_prompt_impl(description):
     return {
         "messages": [
@@ -2477,6 +3830,41 @@ def run_mcp_server():
             """Get the bodies in the active design."""
             return execute_on_fusion_thread(get_bodies_resource)
 
+        @fusion_mcp.resource("fusion://electronics-context")
+        def get_electronics_context():
+            """Get the active Fusion Electronics context, including schematic, board, and library state."""
+            return execute_on_fusion_thread(get_electronics_context_resource)
+
+        @fusion_mcp.resource("fusion://electronics-schematic")
+        def get_electronics_schematic():
+            """Get the active Fusion Electronics schematic state."""
+            return execute_on_fusion_thread(get_electronics_schematic_resource)
+
+        @fusion_mcp.resource("fusion://electronics-board")
+        def get_electronics_board():
+            """Get the active Fusion Electronics board state."""
+            return execute_on_fusion_thread(get_electronics_board_resource)
+
+        @fusion_mcp.resource("fusion://electronics-library")
+        def get_electronics_library():
+            """Get the active Fusion Electronics library state."""
+            return execute_on_fusion_thread(get_electronics_library_resource)
+
+        @fusion_mcp.resource("fusion://electronics-libraries")
+        def get_electronics_libraries():
+            """List the libraries referenced by the active electronics document."""
+            return execute_on_fusion_thread(get_electronics_libraries_resource)
+
+        @fusion_mcp.resource("fusion://electronics-documents")
+        def get_electronics_documents():
+            """List open and available electronics documents and data files."""
+            return execute_on_fusion_thread(get_electronics_documents_resource)
+
+        @fusion_mcp.resource("fusion://electronics-errors")
+        def get_electronics_errors():
+            """Get ERC and DRC errors from the active electronics schematic and board."""
+            return execute_on_fusion_thread(get_electronics_errors_resource)
+
         @fusion_mcp.resource("fusion://mcp-capabilities")
         def get_mcp_capabilities():
             """Describe the fixed MCP surface and the generic Fusion API bridge."""
@@ -2600,6 +3988,56 @@ def run_mcp_server():
             return execute_on_fusion_thread(lambda: export_active_drawing_pdf_impl(filename))
 
         @fusion_mcp.tool()
+        def create_electronics_sheet(name: str = "") -> dict:
+            """Create a new sheet in the active electronics schematic."""
+            return execute_on_fusion_thread(lambda: create_electronics_sheet_impl(name))
+
+        @fusion_mcp.tool()
+        def begin_electronics_change(change_id: str = "", target: str = "active") -> dict:
+            """Begin an electronics design-change transaction."""
+            return execute_on_fusion_thread(lambda: begin_electronics_change_impl(change_id, target))
+
+        @fusion_mcp.tool()
+        def end_electronics_change(target: str = "active") -> dict:
+            """Commit the current electronics design-change transaction."""
+            return execute_on_fusion_thread(lambda: end_electronics_change_impl(target))
+
+        @fusion_mcp.tool()
+        def cancel_electronics_change(target: str = "active") -> dict:
+            """Cancel the current electronics design-change transaction."""
+            return execute_on_fusion_thread(lambda: cancel_electronics_change_impl(target))
+
+        @fusion_mcp.tool()
+        def list_electronics_documents() -> dict:
+            """List open and available electronics schematic, board, project, and library documents."""
+            return execute_on_fusion_thread(list_electronics_documents_impl)
+
+        @fusion_mcp.tool()
+        def upload_electronics_project(schematic_path: str = "", board_path: str = "", library_paths: list[str] = None, open_documents: bool = True, activate_target: str = "schematic") -> dict:
+            """Upload schematic, board, and library files into Fusion and optionally open them."""
+            return execute_on_fusion_thread(lambda: upload_electronics_project_impl(schematic_path, board_path, library_paths, open_documents, activate_target))
+
+        @fusion_mcp.tool()
+        def open_electronics_document(name: str, target: str = "schematic", activate: bool = True, open_related: bool = False) -> dict:
+            """Open an uploaded electronics schematic, board, project, or library by name."""
+            return execute_on_fusion_thread(lambda: open_electronics_document_impl(name, target, activate, open_related))
+
+        @fusion_mcp.tool()
+        def activate_electronics_document(name: str, target: str = "schematic") -> dict:
+            """Activate an already open electronics schematic, board, project, or library by name."""
+            return execute_on_fusion_thread(lambda: activate_electronics_document_impl(name, target))
+
+        @fusion_mcp.tool()
+        def export_electronics_file(format: str, filename: str = "", target: str = "active") -> dict:
+            """Export the active electronics design as EAGLE SCH, BRD, or LBR."""
+            return execute_on_fusion_thread(lambda: export_electronics_file_impl(format, filename, target))
+
+        @fusion_mcp.tool()
+        def execute_text_command(command: str) -> dict:
+            """Run a Fusion text command directly through the active application."""
+            return execute_on_fusion_thread(lambda: execute_text_command_impl(command))
+
+        @fusion_mcp.tool()
         def inspect_fusion_object(path: str = "root_component", include_private: bool = False, max_members: int = 200, include_values: bool = True) -> dict:
             """Inspect any live Fusion API object by Python path and list its members."""
             return execute_on_fusion_thread(lambda: inspect_fusion_object_impl(path, include_private, max_members, include_values))
@@ -2608,6 +4046,11 @@ def run_mcp_server():
         def execute_fusion_api(script: str = "", expression: str = "", input_data: dict = None, result_variable: str = "result") -> dict:
             """Execute arbitrary Python against the live Fusion API with design, drawing, and CAM context."""
             return execute_on_fusion_thread(lambda: execute_fusion_api_impl(script, expression, input_data, result_variable))
+
+        @fusion_mcp.tool()
+        def execute_electronics_api(script: str = "", expression: str = "", input_data: dict = None, result_variable: str = "result") -> dict:
+            """Execute arbitrary Python against the live Fusion Electronics API with schematic, board, library, and design context."""
+            return execute_on_fusion_thread(lambda: execute_electronics_api_impl(script, expression, input_data, result_variable))
 
         print("Registering prompts...")
 
@@ -2633,6 +4076,13 @@ def run_mcp_server():
             "fusion://components": get_components,
             "fusion://sketches": get_sketches,
             "fusion://bodies": get_bodies,
+            "fusion://electronics-context": get_electronics_context,
+            "fusion://electronics-schematic": get_electronics_schematic,
+            "fusion://electronics-board": get_electronics_board,
+            "fusion://electronics-library": get_electronics_library,
+            "fusion://electronics-libraries": get_electronics_libraries,
+            "fusion://electronics-documents": get_electronics_documents,
+            "fusion://electronics-errors": get_electronics_errors,
             "fusion://mcp-capabilities": get_mcp_capabilities,
         }
 
@@ -2660,8 +4110,19 @@ def run_mcp_server():
             "export_sketch_dxf": lambda params: export_sketch_dxf(**params),
             "export_design_file": lambda params: export_design_file(**params),
             "export_active_drawing_pdf": lambda params: export_active_drawing_pdf(**params),
+            "create_electronics_sheet": lambda params: create_electronics_sheet(**params),
+            "begin_electronics_change": lambda params: begin_electronics_change(**params),
+            "end_electronics_change": lambda params: end_electronics_change(**params),
+            "cancel_electronics_change": lambda params: cancel_electronics_change(**params),
+            "list_electronics_documents": lambda params: list_electronics_documents(**params),
+            "upload_electronics_project": lambda params: upload_electronics_project(**params),
+            "open_electronics_document": lambda params: open_electronics_document(**params),
+            "activate_electronics_document": lambda params: activate_electronics_document(**params),
+            "export_electronics_file": lambda params: export_electronics_file(**params),
+            "execute_text_command": lambda params: execute_text_command(**params),
             "inspect_fusion_object": lambda params: inspect_fusion_object(**params),
             "execute_fusion_api": lambda params: execute_fusion_api(**params),
+            "execute_electronics_api": lambda params: execute_electronics_api(**params),
         }
 
         prompt_dispatch = {
