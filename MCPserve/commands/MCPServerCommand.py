@@ -25,6 +25,13 @@ message_command_handlers = []  # Store command handlers to prevent garbage colle
 # Initialize the global handlers list
 handlers = []
 SCRIPT_STATE = {}
+FUSION_MAIN_THREAD_ID = None
+MAIN_THREAD_EVENT_ID = "MCPserve_MainThreadCall"
+main_thread_custom_event = None
+main_thread_event_handler = None
+main_thread_requests = {}
+main_thread_requests_lock = threading.Lock()
+main_thread_request_counter = 0
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 3000
@@ -134,6 +141,164 @@ def write_text(path, content, mode="w"):
 
 def append_text(path, content):
     write_text(path, content, mode="a")
+
+
+def capture_fusion_main_thread():
+    global FUSION_MAIN_THREAD_ID
+
+    if FUSION_MAIN_THREAD_ID is None:
+        FUSION_MAIN_THREAD_ID = threading.get_ident()
+
+
+def is_fusion_main_thread():
+    return FUSION_MAIN_THREAD_ID is not None and threading.get_ident() == FUSION_MAIN_THREAD_ID
+
+
+def settle_fusion_processing(cycles=3, delay_seconds=0.05):
+    for _ in range(max(0, int(cycles))):
+        try:
+            adsk.doEvents()
+        except Exception:
+            pass
+
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+
+class FusionMainThreadEventHandler(adsk.core.CustomEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        event_args = adsk.core.CustomEventArgs.cast(args)
+        request_id = ""
+        try:
+            request_id = event_args.additionalInfo if event_args else ""
+        except Exception:
+            request_id = ""
+
+        if is_blank(request_id):
+            return
+
+        with main_thread_requests_lock:
+            request = main_thread_requests.get(request_id)
+
+        if not request:
+            return
+
+        try:
+            request["result"] = request["callback"]()
+            settle_fusion_processing()
+        except Exception as exc:
+            request["error"] = exc
+            request["traceback"] = traceback.format_exc()
+        finally:
+            request["event"].set()
+
+
+def ensure_main_thread_event_registered():
+    global main_thread_custom_event
+    global main_thread_event_handler
+
+    if main_thread_custom_event and main_thread_event_handler:
+        return main_thread_custom_event
+
+    capture_fusion_main_thread()
+
+    try:
+        main_thread_custom_event = app.registerCustomEvent(MAIN_THREAD_EVENT_ID)
+    except Exception:
+        try:
+            app.unregisterCustomEvent(MAIN_THREAD_EVENT_ID)
+        except Exception:
+            pass
+        main_thread_custom_event = app.registerCustomEvent(MAIN_THREAD_EVENT_ID)
+
+    main_thread_event_handler = FusionMainThreadEventHandler()
+    main_thread_custom_event.add(main_thread_event_handler)
+    handlers.append(main_thread_event_handler)
+    return main_thread_custom_event
+
+
+def unregister_main_thread_event():
+    global main_thread_custom_event
+    global main_thread_event_handler
+
+    if not main_thread_custom_event:
+        return
+
+    try:
+        app.unregisterCustomEvent(MAIN_THREAD_EVENT_ID)
+    except Exception:
+        pass
+
+    main_thread_custom_event = None
+    main_thread_event_handler = None
+
+    with main_thread_requests_lock:
+        pending_requests = list(main_thread_requests.values())
+        main_thread_requests.clear()
+
+    for request in pending_requests:
+        request["error"] = RuntimeError("Fusion main-thread event was unregistered before the request finished")
+        request["traceback"] = ""
+        request["event"].set()
+
+
+def run_in_fusion_main_thread(callback, timeout_seconds=120.0):
+    if not callable(callback):
+        raise TypeError("callback must be callable")
+
+    capture_fusion_main_thread()
+
+    if is_fusion_main_thread():
+        result = callback()
+        settle_fusion_processing()
+        return result
+
+    ensure_main_thread_event_registered()
+
+    global main_thread_request_counter
+    with main_thread_requests_lock:
+        main_thread_request_counter += 1
+        request_id = f"{int(time.time() * 1000)}_{main_thread_request_counter}"
+        request = {
+            "callback": callback,
+            "event": threading.Event(),
+            "result": None,
+            "error": None,
+            "traceback": "",
+        }
+        main_thread_requests[request_id] = request
+
+    app.fireCustomEvent(MAIN_THREAD_EVENT_ID, request_id)
+
+    if not request["event"].wait(timeout_seconds):
+        with main_thread_requests_lock:
+            main_thread_requests.pop(request_id, None)
+        raise TimeoutError(f"Timed out waiting for Fusion main-thread execution: {request_id}")
+
+    with main_thread_requests_lock:
+        main_thread_requests.pop(request_id, None)
+
+    if request["error"]:
+        exc = request["error"]
+        if getattr(exc, "_fusion_main_thread_traceback", None) is None:
+            setattr(exc, "_fusion_main_thread_traceback", request.get("traceback", ""))
+        raise exc
+
+    return request["result"]
+
+
+def call_fusion_api(callback, timeout_seconds=120.0):
+    try:
+        return run_in_fusion_main_thread(callback, timeout_seconds)
+    except Exception as exc:
+        trace_text = getattr(exc, "_fusion_main_thread_traceback", "")
+        payload = error_payload("Fusion API call failed", exc)
+        if trace_text:
+            payload["traceback"] = trace_text
+        return payload
 
 
 def get_document_type_name(doc):
@@ -2230,7 +2395,7 @@ def run_mcp_server():
                 append_text(debug_path, f"Trying command-based test message at server startup: {time.ctime()}\n")
                 
                 # Try to show the message box using command-based approach
-                create_message_box_command(test_message)
+                run_in_fusion_main_thread(lambda: create_message_box_command(test_message))
 
                 append_text(debug_path, f"Command-based test message triggered at {time.ctime()}\n")
             except Exception as e:
@@ -2278,193 +2443,197 @@ def run_mcp_server():
             f.write("\n")
         
         print("Registering resources...")
+
+        def execute_on_fusion_thread(callback):
+            return call_fusion_api(callback)
+
         @fusion_mcp.resource("fusion://active-document-info")
         def get_active_document_info():
             """Get information about the active document in Fusion 360."""
-            return get_active_document_info_resource()
+            return execute_on_fusion_thread(get_active_document_info_resource)
 
         @fusion_mcp.resource("fusion://design-structure")
         def get_design_structure():
             """Get the structure of the active design in Fusion 360."""
-            return get_design_structure_resource()
+            return execute_on_fusion_thread(get_design_structure_resource)
 
         @fusion_mcp.resource("fusion://parameters")
         def get_parameters():
             """Get the parameters of the active design in Fusion 360."""
-            return get_parameters_resource()
+            return execute_on_fusion_thread(get_parameters_resource)
 
         @fusion_mcp.resource("fusion://components")
         def get_components():
             """Get the components in the active design."""
-            return get_components_resource()
+            return execute_on_fusion_thread(get_components_resource)
 
         @fusion_mcp.resource("fusion://sketches")
         def get_sketches():
             """Get the sketches in the active design."""
-            return get_sketches_resource()
+            return execute_on_fusion_thread(get_sketches_resource)
 
         @fusion_mcp.resource("fusion://bodies")
         def get_bodies():
             """Get the bodies in the active design."""
-            return get_bodies_resource()
+            return execute_on_fusion_thread(get_bodies_resource)
 
         @fusion_mcp.resource("fusion://mcp-capabilities")
         def get_mcp_capabilities():
             """Describe the fixed MCP surface and the generic Fusion API bridge."""
-            return get_mcp_capabilities_resource()
+            return execute_on_fusion_thread(get_mcp_capabilities_resource)
 
         print("Registering tools...")
 
         @fusion_mcp.tool()
         def message_box(message: str) -> str:
             """Display a message box in Fusion 360."""
-            return message_box_impl(message)
+            return execute_on_fusion_thread(lambda: message_box_impl(message))
 
         @fusion_mcp.tool()
         def create_new_sketch(plane_name: str, component_name: str = "", sketch_name: str = "") -> str:
             """Create a new sketch on the specified plane."""
-            return create_new_sketch_impl(plane_name, component_name, sketch_name)
+            return execute_on_fusion_thread(lambda: create_new_sketch_impl(plane_name, component_name, sketch_name))
 
         @fusion_mcp.tool()
         def create_parameter(name: str, expression: str, unit: str, comment: str = "") -> str:
             """Create or update a parameter in the active design."""
-            return create_parameter_impl(name, expression, unit, comment)
+            return execute_on_fusion_thread(lambda: create_parameter_impl(name, expression, unit, comment))
 
         @fusion_mcp.tool()
         def create_component(name: str, reuse_existing: bool = True) -> dict:
             """Create a new component in the active design."""
-            return create_component_impl(name, reuse_existing)
+            return execute_on_fusion_thread(lambda: create_component_impl(name, reuse_existing))
 
         @fusion_mcp.tool()
         def create_offset_plane(base_plane_name: str, offset: float | str, component_name: str = "", plane_name: str = "") -> dict:
             """Create a construction plane offset from an existing plane."""
-            return create_offset_plane_impl(base_plane_name, offset, component_name, plane_name)
+            return execute_on_fusion_thread(lambda: create_offset_plane_impl(base_plane_name, offset, component_name, plane_name))
 
         @fusion_mcp.tool()
         def list_sketch_entities(sketch_name: str, component_name: str = "") -> dict:
             """List sketch points and curves, including entity tokens."""
-            return list_sketch_entities_impl(sketch_name, component_name)
+            return execute_on_fusion_thread(lambda: list_sketch_entities_impl(sketch_name, component_name))
 
         @fusion_mcp.tool()
         def list_sketch_profiles(sketch_name: str, component_name: str = "") -> dict:
             """List sketch profiles for a sketch."""
-            return list_sketch_profiles_impl(sketch_name, component_name)
+            return execute_on_fusion_thread(lambda: list_sketch_profiles_impl(sketch_name, component_name))
 
         @fusion_mcp.tool()
         def create_sketch_point(sketch_name: str, x: float | str, y: float | str, z: float | str = 0.0, component_name: str = "") -> dict:
             """Create a sketch point using sketch-space coordinates."""
-            return create_sketch_point_impl(sketch_name, x, y, z, component_name)
+            return execute_on_fusion_thread(lambda: create_sketch_point_impl(sketch_name, x, y, z, component_name))
 
         @fusion_mcp.tool()
         def create_sketch_line(sketch_name: str, start_x: float | str, start_y: float | str, end_x: float | str, end_y: float | str, start_z: float | str = 0.0, end_z: float | str = 0.0, component_name: str = "") -> dict:
             """Create a sketch line between two sketch-space points."""
-            return create_sketch_line_impl(sketch_name, start_x, start_y, end_x, end_y, start_z, end_z, component_name)
+            return execute_on_fusion_thread(lambda: create_sketch_line_impl(sketch_name, start_x, start_y, end_x, end_y, start_z, end_z, component_name))
 
         @fusion_mcp.tool()
         def create_sketch_lines(sketch_name: str, points: list[dict], component_name: str = "") -> dict:
             """Create a polyline from multiple sketch-space points."""
-            return create_sketch_lines_impl(sketch_name, points, component_name)
+            return execute_on_fusion_thread(lambda: create_sketch_lines_impl(sketch_name, points, component_name))
 
         @fusion_mcp.tool()
         def create_sketch_circle(sketch_name: str, center_x: float | str, center_y: float | str, radius: float | str, center_z: float | str = 0.0, component_name: str = "") -> dict:
             """Create a sketch circle from a center point and radius."""
-            return create_sketch_circle_impl(sketch_name, center_x, center_y, radius, center_z, component_name)
+            return execute_on_fusion_thread(lambda: create_sketch_circle_impl(sketch_name, center_x, center_y, radius, center_z, component_name))
 
         @fusion_mcp.tool()
         def create_sketch_rectangle(sketch_name: str, x1: float | str, y1: float | str, x2: float | str, y2: float | str, z1: float | str = 0.0, z2: float | str = 0.0, component_name: str = "") -> dict:
             """Create a two-point sketch rectangle."""
-            return create_sketch_rectangle_impl(sketch_name, x1, y1, x2, y2, z1, z2, component_name)
+            return execute_on_fusion_thread(lambda: create_sketch_rectangle_impl(sketch_name, x1, y1, x2, y2, z1, z2, component_name))
 
         @fusion_mcp.tool()
         def create_sketch_center_rectangle(sketch_name: str, center_x: float | str, center_y: float | str, corner_x: float | str, corner_y: float | str, center_z: float | str = 0.0, corner_z: float | str = 0.0, component_name: str = "") -> dict:
             """Create a center-point sketch rectangle."""
-            return create_sketch_center_rectangle_impl(sketch_name, center_x, center_y, corner_x, corner_y, center_z, corner_z, component_name)
+            return execute_on_fusion_thread(lambda: create_sketch_center_rectangle_impl(sketch_name, center_x, center_y, corner_x, corner_y, center_z, corner_z, component_name))
 
         @fusion_mcp.tool()
         def create_sketch_arc(sketch_name: str, center_x: float | str, center_y: float | str, start_x: float | str, start_y: float | str, sweep_angle: float | str, center_z: float | str = 0.0, start_z: float | str = 0.0, component_name: str = "") -> dict:
             """Create a sketch arc from center, start point, and sweep angle."""
-            return create_sketch_arc_impl(sketch_name, center_x, center_y, start_x, start_y, sweep_angle, center_z, start_z, component_name)
+            return execute_on_fusion_thread(lambda: create_sketch_arc_impl(sketch_name, center_x, center_y, start_x, start_y, sweep_angle, center_z, start_z, component_name))
 
         @fusion_mcp.tool()
         def create_sketch_spline(sketch_name: str, points: list[dict], component_name: str = "") -> dict:
             """Create a fitted spline through multiple sketch-space points."""
-            return create_sketch_spline_impl(sketch_name, points, component_name)
+            return execute_on_fusion_thread(lambda: create_sketch_spline_impl(sketch_name, points, component_name))
 
         @fusion_mcp.tool()
         def add_sketch_constraint(sketch_name: str, constraint_type: str, entity_one_token: str = "", entity_two_token: str = "", entity_three_token: str = "", component_name: str = "") -> dict:
             """Apply a geometric constraint using sketch entity tokens."""
-            return add_sketch_constraint_impl(sketch_name, constraint_type, entity_one_token, entity_two_token, entity_three_token, component_name)
+            return execute_on_fusion_thread(lambda: add_sketch_constraint_impl(sketch_name, constraint_type, entity_one_token, entity_two_token, entity_three_token, component_name))
 
         @fusion_mcp.tool()
         def add_sketch_dimension(sketch_name: str, dimension_type: str, entity_one_token: str, entity_two_token: str = "", text_x: float | str = 0.0, text_y: float | str = 0.0, text_z: float | str = 0.0, orientation: str = "aligned", expression: str = "", component_name: str = "") -> dict:
             """Add a driving sketch dimension using sketch entity tokens."""
-            return add_sketch_dimension_impl(sketch_name, dimension_type, entity_one_token, entity_two_token, text_x, text_y, text_z, orientation, expression, component_name)
+            return execute_on_fusion_thread(lambda: add_sketch_dimension_impl(sketch_name, dimension_type, entity_one_token, entity_two_token, text_x, text_y, text_z, orientation, expression, component_name))
 
         @fusion_mcp.tool()
         def create_extrude(sketch_name: str = "", distance: float | str = "10 mm", profile_index: int = 0, operation: str = "new_body", component_name: str = "", feature_name: str = "", body_name: str = "", direction: str = "positive", profile_token: str = "") -> dict:
             """Extrude a sketch profile into a 3D feature."""
-            return create_extrude_impl(sketch_name, distance, profile_index, operation, component_name, feature_name, body_name, direction, profile_token)
+            return execute_on_fusion_thread(lambda: create_extrude_impl(sketch_name, distance, profile_index, operation, component_name, feature_name, body_name, direction, profile_token))
 
         @fusion_mcp.tool()
         def create_revolve(sketch_name: str = "", axis_token: str = "", angle: float | str = "360 deg", profile_index: int = 0, operation: str = "new_body", component_name: str = "", feature_name: str = "", body_name: str = "", profile_token: str = "", axis_name: str = "") -> dict:
             """Revolve a sketch profile around an axis entity token."""
-            return create_revolve_impl(sketch_name, axis_token, angle, profile_index, operation, component_name, feature_name, body_name, profile_token, axis_name)
+            return execute_on_fusion_thread(lambda: create_revolve_impl(sketch_name, axis_token, angle, profile_index, operation, component_name, feature_name, body_name, profile_token, axis_name))
 
         @fusion_mcp.tool()
         def delete_body(body_name: str, component_name: str = "", allow_partial_match: bool = False, delete_all_matches: bool = False) -> dict:
             """Delete one or more bodies from the active design."""
-            return delete_body_impl(body_name, component_name, allow_partial_match, delete_all_matches)
+            return execute_on_fusion_thread(lambda: delete_body_impl(body_name, component_name, allow_partial_match, delete_all_matches))
 
         @fusion_mcp.tool()
         def export_sketch_dxf(sketch_name: str, filename: str = "", component_name: str = "") -> dict:
             """Export a sketch to a DXF file."""
-            return export_sketch_dxf_impl(sketch_name, filename, component_name)
+            return execute_on_fusion_thread(lambda: export_sketch_dxf_impl(sketch_name, filename, component_name))
 
         @fusion_mcp.tool()
         def export_design_file(format: str, filename: str = "", component_name: str = "", body_name: str = "") -> dict:
             """Export the active design to STEP, IGES, SAT, STL, 3MF, or OBJ."""
-            return export_design_file_impl(format, filename, component_name, body_name)
+            return execute_on_fusion_thread(lambda: export_design_file_impl(format, filename, component_name, body_name))
 
         @fusion_mcp.tool()
         def export_active_drawing_pdf(filename: str = "") -> dict:
             """Export the active drawing document to PDF."""
-            return export_active_drawing_pdf_impl(filename)
+            return execute_on_fusion_thread(lambda: export_active_drawing_pdf_impl(filename))
 
         @fusion_mcp.tool()
         def inspect_fusion_object(path: str = "root_component", include_private: bool = False, max_members: int = 200, include_values: bool = True) -> dict:
             """Inspect any live Fusion API object by Python path and list its members."""
-            return inspect_fusion_object_impl(path, include_private, max_members, include_values)
+            return execute_on_fusion_thread(lambda: inspect_fusion_object_impl(path, include_private, max_members, include_values))
 
         @fusion_mcp.tool()
         def execute_fusion_api(script: str = "", expression: str = "", input_data: dict = None, result_variable: str = "result") -> dict:
             """Execute arbitrary Python against the live Fusion API with design, drawing, and CAM context."""
-            return execute_fusion_api_impl(script, expression, input_data, result_variable)
+            return execute_on_fusion_thread(lambda: execute_fusion_api_impl(script, expression, input_data, result_variable))
 
         print("Registering prompts...")
 
         @fusion_mcp.prompt()
         def create_sketch_prompt(description: str) -> dict:
             """Create a prompt for creating a sketch based on a description."""
-            return create_sketch_prompt_impl(description)
+            return execute_on_fusion_thread(lambda: create_sketch_prompt_impl(description))
 
         @fusion_mcp.prompt()
         def parameter_setup_prompt(description: str) -> dict:
             """Create a prompt for setting up parameters based on a description."""
-            return parameter_setup_prompt_impl(description)
+            return execute_on_fusion_thread(lambda: parameter_setup_prompt_impl(description))
 
         @fusion_mcp.prompt()
         def feature_strategy_prompt(description: str) -> dict:
             """Create a prompt for planning sketches and features for a Fusion model."""
-            return feature_strategy_prompt_impl(description)
+            return execute_on_fusion_thread(lambda: feature_strategy_prompt_impl(description))
 
         resource_dispatch = {
-            "fusion://active-document-info": get_active_document_info_resource,
-            "fusion://design-structure": get_design_structure_resource,
-            "fusion://parameters": get_parameters_resource,
-            "fusion://components": get_components_resource,
-            "fusion://sketches": get_sketches_resource,
-            "fusion://bodies": get_bodies_resource,
-            "fusion://mcp-capabilities": get_mcp_capabilities_resource,
+            "fusion://active-document-info": get_active_document_info,
+            "fusion://design-structure": get_design_structure,
+            "fusion://parameters": get_parameters,
+            "fusion://components": get_components,
+            "fusion://sketches": get_sketches,
+            "fusion://bodies": get_bodies,
+            "fusion://mcp-capabilities": get_mcp_capabilities,
         }
 
         tool_dispatch = {
@@ -2631,7 +2800,7 @@ def run_mcp_server():
                                     # Try to display the message directly as well
                                     try:
                                         # Use command-based approach for the most reliable display
-                                        create_message_box_command(message)
+                                        run_in_fusion_main_thread(lambda: create_message_box_command(message))
                                         with open(debug_file, "a", encoding="utf-8") as f:
                                             f.write(f"Command-based display triggered\n")
                                     except Exception as e:
@@ -2665,7 +2834,7 @@ def run_mcp_server():
                                     command_file = os.path.join(comm_dir, file)
                                     try:
                                         # Extract the command ID from the filename
-                                        command_id = file.split("_")[1].split(".")[0]
+                                        command_id = file[len("command_"):-len(".json")]
                                         
                                         # Check if we've already processed this command
                                         processed_file = os.path.join(comm_dir, f"processed_command_{command_id}.json")
@@ -2781,6 +2950,8 @@ def start_server():
     global server_running
     
     print("Starting MCP server...")
+    capture_fusion_main_thread()
+    ensure_main_thread_event_registered()
     
     # Create workspace comm directory if it doesn't exist
     workspace_comm_dir = primary_comm_dir()
@@ -2842,6 +3013,7 @@ def stop_server():
     
     if not server_running:
         print("MCP server is not running")
+        unregister_main_thread_event()
         return
     
     # Set server running flag to stop the server loop
@@ -2851,6 +3023,7 @@ def stop_server():
     if server_thread and server_thread.is_alive():
         server_thread.join(timeout=2.0)
     
+    unregister_main_thread_event()
     print("MCP server stopped")
 
 # Command event handlers
@@ -2969,6 +3142,7 @@ def stop_server_on_stop(context):
                 server_thread.join(timeout=2.0)
             
             print("MCP server stopped")
+        unregister_main_thread_event()
     except:
         if ui:
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
@@ -3015,6 +3189,7 @@ def stop():
     try:
         # Stop the server
         stop_server_on_stop(None)
+        unregister_main_thread_event()
         
         # Clean up UI
         command_definitions = ui.commandDefinitions

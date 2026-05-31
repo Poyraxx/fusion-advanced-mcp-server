@@ -42,6 +42,11 @@ The add-in exposes two communication paths:
 
 The SSE endpoint is the primary path. The file-based path is intentionally preserved for local testing, recovery scenarios, and clients that cannot attach directly to the HTTP endpoint.
 
+Recent stability improvements:
+
+- File-based commands preserve the full `command_<id>.json` identifier, including IDs that contain underscores.
+- Fusion API work requested through MCP is marshaled onto Fusion's main thread instead of being executed directly from background monitor threads.
+
 ## Feature overview
 
 ### Resources
@@ -107,6 +112,7 @@ This project is not limited to a minimal sketch demo. The current implementation
 - Iterative cleanup by removing obsolete bodies.
 - Export to `STEP`, `IGES`, `SAT`, `STL`, `3MF`, `OBJ`, `DXF`, and drawing `PDF`.
 - File-based fallback commands for smoke testing even when direct MCP transport is unavailable.
+- Main-thread dispatch for Fusion API calls to reduce instability during heavier modeling or export operations.
 - Dynamic live inspection of Fusion API objects, collections, and selected entities.
 - A general-purpose execution bridge for unsupported or newly needed Fusion API features without waiting for a dedicated MCP tool.
 
