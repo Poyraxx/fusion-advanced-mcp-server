@@ -1,0 +1,14 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "91b0e5f1-3bc0-47bc-a7fd-c3ac4c42e178",
+  "author": "fusion-mcp-server contributors",
+  "description": {
+    "": "Runs a Fusion 360 MCP server that can be used by coding agents such as Codex."
+  },
+  "version": "1.0.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac",
+  "editEnabled": true,
+  "iconFilename": "AddInIcon.svg"
+}
