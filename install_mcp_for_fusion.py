@@ -11,6 +11,7 @@ import subprocess
 import glob
 import winreg
 import ctypes
+import argparse
 from pathlib import Path
 
 def is_admin():
@@ -78,7 +79,16 @@ def find_fusion_python_paths():
                     if os.path.exists(path) and path not in python_paths:
                         python_paths.append(path)
     
-    return python_paths
+    unique_paths = []
+    seen = set()
+    for path in python_paths:
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_paths.append(path)
+    
+    return unique_paths
 
 def install_mcp(python_path):
     """Install MCP using the specified Python executable"""
@@ -94,7 +104,7 @@ def install_mcp(python_path):
         
         # Install MCP with CLI extras and the local HTTP server dependency.
         result = subprocess.run(
-            [python_path, "-m", "pip", "install", "mcp[cli]", "uvicorn"],
+            [python_path, "-m", "pip", "install", "--upgrade", "mcp[cli]", "uvicorn"],
             capture_output=True,
             text=True,
             check=True
@@ -132,7 +142,27 @@ def install_mcp(python_path):
         print(f"Error: {str(e)}")
         return False
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Install MCP and uvicorn into Fusion 360 Python runtimes.")
+    parser.add_argument("--yes", action="store_true", help="Proceed without interactive confirmation.")
+    parser.add_argument("--python-path", help="Install into a specific Fusion 360 python.exe path.")
+    parser.add_argument("--latest-only", action="store_true", help="Install only into the most recently modified detected Fusion Python.")
+    return parser.parse_args(argv)
+
+
+def choose_latest_python_path(python_paths):
+    if not python_paths:
+        return []
+    return [
+        max(
+            python_paths,
+            key=lambda path: os.path.getmtime(path) if os.path.exists(path) else 0
+        )
+    ]
+
+
+def main(argv=None):
+    args = parse_args(argv)
     print("=== MCP Installer for Fusion 360 ===")
     print("This script will install the MCP package for ALL detected Fusion 360 Python environments.")
     
@@ -143,7 +173,13 @@ def main():
     
     # Find Python paths
     print("\nSearching for Fusion 360 Python installations...")
-    python_paths = find_fusion_python_paths()
+    if args.python_path:
+        python_paths = [args.python_path] if os.path.exists(args.python_path) else []
+        if not python_paths:
+            print(f"Specified python path does not exist: {args.python_path}")
+            return 1
+    else:
+        python_paths = find_fusion_python_paths()
     
     if not python_paths:
         print("No Fusion 360 Python installations found automatically.")
@@ -154,7 +190,10 @@ def main():
             if custom_path:
                 print(f"Path does not exist: {custom_path}")
             print("\nExiting without installation.")
-            return
+            return 1
+
+    if args.latest_only:
+        python_paths = choose_latest_python_path(python_paths)
     
     # Display found paths
     print(f"\nFound {len(python_paths)} potential Fusion 360 Python installation(s):")
@@ -164,11 +203,14 @@ def main():
     # Ask for confirmation to install for all instances
     print(f"\nThis will install MCP with CLI extras and uvicorn for ALL {len(python_paths)} Python installations.")
     print("Using package specification: mcp[cli] uvicorn")
-    confirm = input("Proceed with installation for all installations[ERROR] (y/n): ")
     
-    if confirm.lower() != 'y':
-        print("Installation cancelled.")
-        return
+    if args.yes or not sys.stdin.isatty():
+        print("Proceeding without interactive confirmation.")
+    else:
+        confirm = input("Proceed with installation for all installations (y/n): ")
+        if confirm.lower() != 'y':
+            print("Installation cancelled.")
+            return 1
     
     # Install MCP for all found Python installations
     successful_installs = 0
@@ -197,7 +239,10 @@ def main():
         print("  1. Run this script as administrator")
         print("  2. Or install manually with: '[Python Path]' -m pip install \"mcp[cli]\" uvicorn")
     
-    input("\nPress Enter to exit...")
+    if sys.stdin.isatty():
+        input("\nPress Enter to exit...")
+
+    return 0 if failed_installs == 0 else 1
 
 if __name__ == "__main__":
-    main() 
+    raise SystemExit(main()) 

@@ -18,6 +18,8 @@ import json
 import asyncio
 import math
 import re
+import subprocess
+import importlib
 from pathlib import Path
 
 # Global variables
@@ -37,10 +39,26 @@ main_thread_event_handler = None
 main_thread_requests = {}
 main_thread_requests_lock = threading.Lock()
 main_thread_request_counter = 0
+runtime_install_lock = threading.Lock()
+runtime_install_thread = None
+runtime_install_state = {
+    "in_progress": False,
+    "attempted": False,
+    "success": False,
+    "message": "",
+    "log_path": "",
+    "started_at": "",
+    "completed_at": "",
+}
+last_start_server_state = {
+    "code": "idle",
+    "message": "",
+}
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 3000
 SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/sse"
+REQUIRED_RUNTIME_PACKAGES = ("mcp[cli]", "uvicorn")
 
 RESOURCE_URIS = [
     "fusion://active-document-info",
@@ -164,6 +182,41 @@ def write_text(path, content, mode="w"):
 
 def append_text(path, content):
     write_text(path, content, mode="a")
+
+
+def set_last_start_server_state(code, message=""):
+    global last_start_server_state
+    last_start_server_state = {
+        "code": code,
+        "message": message or "",
+    }
+
+
+def get_last_start_server_state():
+    return dict(last_start_server_state)
+
+
+def get_runtime_install_state():
+    with runtime_install_lock:
+        return dict(runtime_install_state)
+
+
+def update_runtime_install_state(**kwargs):
+    with runtime_install_lock:
+        runtime_install_state.update(kwargs)
+        return dict(runtime_install_state)
+
+
+def runtime_install_log_path():
+    return comm_file("mcp_runtime_install.log")
+
+
+def reset_runtime_install_log():
+    write_text(runtime_install_log_path(), "")
+
+
+def append_runtime_install_log(message):
+    append_text(runtime_install_log_path(), f"[{time.ctime()}] {message}\n")
 
 
 def capture_fusion_main_thread():
@@ -3707,23 +3760,280 @@ def feature_strategy_prompt_impl(description):
         ]
     }
 
+
+def find_fusion_python_executable():
+    candidates = []
+    seen = set()
+
+    def add_candidate(path_value):
+        if not path_value:
+            return
+        try:
+            candidate = Path(path_value)
+            if not candidate.exists():
+                return
+            normalized = str(candidate.resolve()).lower()
+            if normalized in seen:
+                return
+            seen.add(normalized)
+            candidates.append(candidate)
+        except Exception:
+            return
+
+    for executable_value in (sys.executable, getattr(sys, "_base_executable", "")):
+        add_candidate(executable_value)
+        if executable_value:
+            executable_path = Path(executable_value)
+            add_candidate(executable_path.with_name("python.exe"))
+            add_candidate(executable_path.parent / "python.exe")
+            add_candidate(executable_path.parent / "Python" / "python.exe")
+            add_candidate(executable_path.parent.parent / "Python" / "python.exe")
+
+    common_roots = [
+        Path.home() / "AppData" / "Local" / "Autodesk" / "webdeploy" / "production",
+        Path("C:/Program Files/Autodesk/webdeploy/production"),
+        Path("C:/Program Files (x86)/Autodesk/webdeploy/production"),
+    ]
+
+    for root in common_roots:
+        if not root.exists():
+            continue
+        try:
+            for match in root.glob("*/Python/python.exe"):
+                add_candidate(match)
+        except Exception:
+            continue
+
+    for candidate in candidates:
+        if candidate.name.lower() == "python.exe":
+            return candidate
+
+    return candidates[0] if candidates else None
+
+
+def refresh_import_caches_after_install():
+    try:
+        importlib.invalidate_caches()
+    except Exception:
+        pass
+
+
+def run_runtime_install_command(command, timeout_seconds=1800):
+    try:
+        command_text = subprocess.list2cmdline([str(part) for part in command])
+    except Exception:
+        command_text = " ".join(str(part) for part in command)
+
+    append_runtime_install_log(f"Running command: {command_text}")
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        append_runtime_install_log(f"Command timed out after {timeout_seconds} seconds")
+        raise RuntimeError(f"Timed out while running: {command_text}") from exc
+
+    if result.stdout:
+        append_runtime_install_log("stdout:\n" + result.stdout.rstrip())
+    if result.stderr:
+        append_runtime_install_log("stderr:\n" + result.stderr.rstrip())
+    append_runtime_install_log(f"Command exit code: {result.returncode}")
+    return result
+
+
+def install_required_runtime_packages():
+    log_path = runtime_install_log_path()
+    reset_runtime_install_log()
+    append_runtime_install_log(f"Current sys.executable: {sys.executable}")
+
+    python_executable = find_fusion_python_executable()
+    if not python_executable:
+        message = "Could not locate Fusion 360's bundled python.exe automatically."
+        append_runtime_install_log(message)
+        return {
+            "success": False,
+            "message": message,
+            "log_path": str(log_path),
+        }
+
+    append_runtime_install_log(f"Selected Python executable: {python_executable}")
+
+    pip_check = run_runtime_install_command([str(python_executable), "-m", "pip", "--version"], timeout_seconds=120)
+    if pip_check.returncode != 0:
+        append_runtime_install_log("pip was not available. Attempting ensurepip.")
+        ensurepip_result = run_runtime_install_command([str(python_executable), "-m", "ensurepip", "--upgrade"], timeout_seconds=600)
+        if ensurepip_result.returncode != 0:
+            message = "Failed to bootstrap pip inside Fusion 360's Python runtime."
+            append_runtime_install_log(message)
+            return {
+                "success": False,
+                "message": message,
+                "log_path": str(log_path),
+            }
+
+    install_result = run_runtime_install_command(
+        [
+            str(python_executable),
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--disable-pip-version-check",
+            "--no-input",
+            *REQUIRED_RUNTIME_PACKAGES,
+        ],
+        timeout_seconds=1800,
+    )
+    if install_result.returncode != 0:
+        message = "pip install failed while installing MCP runtime packages."
+        append_runtime_install_log(message)
+        return {
+            "success": False,
+            "message": message,
+            "log_path": str(log_path),
+        }
+
+    verify_result = run_runtime_install_command(
+        [str(python_executable), "-c", "import mcp, uvicorn; print(mcp.__file__); print(uvicorn.__file__)"],
+        timeout_seconds=120,
+    )
+    if verify_result.returncode != 0:
+        message = "The runtime packages were installed, but verification imports failed."
+        append_runtime_install_log(message)
+        return {
+            "success": False,
+            "message": message,
+            "log_path": str(log_path),
+        }
+
+    refresh_import_caches_after_install()
+    if not check_mcp_installed():
+        message = "Packages were installed, but the live Fusion Python session still cannot import them."
+        append_runtime_install_log(message)
+        return {
+            "success": False,
+            "message": message,
+            "log_path": str(log_path),
+        }
+
+    message = f"Installed required packages successfully using {python_executable}"
+    append_runtime_install_log(message)
+    return {
+        "success": True,
+        "message": message,
+        "log_path": str(log_path),
+    }
+
+
+def schedule_runtime_package_install():
+    global runtime_install_thread
+
+    with runtime_install_lock:
+        if runtime_install_thread and runtime_install_thread.is_alive():
+            state = dict(runtime_install_state)
+            return {
+                "scheduled": False,
+                "already_in_progress": True,
+                "message": state.get("message") or "Required packages are already being installed automatically.",
+                "log_path": state.get("log_path") or str(runtime_install_log_path()),
+            }
+
+        runtime_install_state.update(
+            {
+                "in_progress": True,
+                "attempted": True,
+                "success": False,
+                "message": "Installing required packages automatically.",
+                "log_path": str(runtime_install_log_path()),
+                "started_at": time.ctime(),
+                "completed_at": "",
+            }
+        )
+
+    def install_worker():
+        try:
+            result = install_required_runtime_packages()
+        except Exception as exc:
+            append_runtime_install_log(f"Unexpected installer error: {str(exc)}")
+            append_runtime_install_log(traceback.format_exc())
+            result = {
+                "success": False,
+                "message": str(exc),
+                "log_path": str(runtime_install_log_path()),
+            }
+
+        update_runtime_install_state(
+            in_progress=False,
+            success=result.get("success", False),
+            message=result.get("message", ""),
+            log_path=result.get("log_path", str(runtime_install_log_path())),
+            completed_at=time.ctime(),
+        )
+
+        if result.get("success"):
+            set_last_start_server_state("packages_installed", result.get("message", ""))
+            start_success = start_server()
+            start_state = get_last_start_server_state()
+
+            if start_success:
+                message = (
+                    "Required packages were installed automatically.\n\n"
+                    f"MCP Server is now running at {SERVER_URL}.\n\n"
+                    f"Install log:\n{result['log_path']}"
+                )
+            else:
+                message = (
+                    "Required packages were installed automatically, but the server did not start cleanly.\n\n"
+                    f"{start_state.get('message', 'See the server logs for details.')}\n\n"
+                    f"Install log:\n{result['log_path']}"
+                )
+        else:
+            set_last_start_server_state("install_failed", result.get("message", "Automatic package installation failed."))
+            message = (
+                "Automatic installation of required packages failed.\n\n"
+                f"{result.get('message', 'Unknown installer error.')}\n\n"
+                f"Install log:\n{result.get('log_path', str(runtime_install_log_path()))}"
+            )
+
+        try:
+            run_in_fusion_main_thread(lambda: ui.messageBox(message))
+        except Exception:
+            append_runtime_install_log("Failed to display installation result message box.")
+
+    runtime_install_thread = threading.Thread(target=install_worker, name="MCPRuntimeInstaller")
+    runtime_install_thread.daemon = True
+    runtime_install_thread.start()
+
+    return {
+        "scheduled": True,
+        "already_in_progress": False,
+        "message": "Installing required packages automatically.",
+        "log_path": str(runtime_install_log_path()),
+    }
+
 # Function to check if MCP package is installed
 def check_mcp_installed():
     missing_packages = []
+    refresh_import_caches_after_install()
     
     try:
         import mcp
         print(f"Found MCP package at: {mcp.__file__}")
     except ImportError as e:
         print(f"Error importing MCP package: {str(e)}")
-        missing_packages.append("mcp[cli]")
+        missing_packages.append(REQUIRED_RUNTIME_PACKAGES[0])
     
     try:
         import uvicorn
         print(f"Found uvicorn package at: {uvicorn.__file__}")
     except ImportError as e:
         print(f"Error importing uvicorn package: {str(e)}")
-        missing_packages.append("uvicorn")
+        missing_packages.append(REQUIRED_RUNTIME_PACKAGES[1])
     
     if missing_packages:
         print(f"Missing required packages: {', '.join(missing_packages)}")
@@ -4411,6 +4721,7 @@ def start_server():
     global server_running
     
     print("Starting MCP server...")
+    set_last_start_server_state("starting", "Starting MCP server.")
     capture_fusion_main_thread()
     ensure_main_thread_event_registered()
     
@@ -4422,13 +4733,25 @@ def start_server():
     
     # Check if MCP is installed
     if not check_mcp_installed():
-        print("Required packages not installed. Cannot start server.")
-        ui.messageBox("Required packages are not installed. Please install them with:\npip install \"mcp[cli]\" uvicorn")
+        print("Required packages are not installed. Attempting automatic installation.")
+        install_status = schedule_runtime_package_install()
+        if install_status.get("already_in_progress"):
+            message = (
+                "Required packages are already being installed automatically.\n\n"
+                f"Install log:\n{install_status.get('log_path', str(runtime_install_log_path()))}"
+            )
+        else:
+            message = (
+                "Required packages are missing. Automatic installation has started.\n\n"
+                f"Install log:\n{install_status.get('log_path', str(runtime_install_log_path()))}"
+            )
+        set_last_start_server_state("installing", message)
         return False
     
     # Check if server is already running
     if server_running and server_thread and server_thread.is_alive():
         print("MCP server is already running")
+        set_last_start_server_state("running", f"MCP Server is already running at {SERVER_URL}")
         return True
     
     # Reset server state
@@ -4442,10 +4765,12 @@ def start_server():
             if not success:
                 print("Failed to start MCP server")
                 server_running = False
+                set_last_start_server_state("failed", "Failed to start MCP server. See error log for details.")
                 ui.messageBox("Failed to start MCP server. See error log for details.")
         except Exception as e:
             print(f"Error in server thread: {str(e)}")
             server_running = False
+            set_last_start_server_state("failed", str(e))
             error_file = workspace_comm_dir / "mcp_server_error.txt"
             with open(error_file, "w", encoding="utf-8") as f:
                 f.write(f"MCP Server Thread Error: {str(e)}\n\n{traceback.format_exc()}")
@@ -4463,9 +4788,11 @@ def start_server():
     if not server_thread.is_alive():
         print("MCP server thread stopped unexpectedly")
         server_running = False
+        set_last_start_server_state("failed", "MCP server thread stopped unexpectedly during startup.")
         return False
     
     print("MCP server started successfully")
+    set_last_start_server_state("running", f"MCP Server is running at {SERVER_URL}")
     return True
 
 # Function to stop the server
@@ -4525,20 +4852,22 @@ class MCPServerCommandExecuteHandler(adsk.core.CommandEventHandler):
         try:
             # Start the server
             success = start_server()
+            start_state = get_last_start_server_state()
             
             # Try to show a test message directly for debugging
             debug_path = comm_file("execute_debug.txt")
             with open(debug_path, "a", encoding="utf-8") as f:
                 f.write(f"Execute handler called at {time.ctime()}\n")
-                f.write(f"Trying command-based test message\n")
+                f.write(f"Current start state: {start_state}\n")
             
-            try:
-                create_message_box_command("MCP Server started - Test Message")
-                with open(debug_path, "a", encoding="utf-8") as f:
-                    f.write(f"Command-based test message triggered at {time.ctime()}\n")
-            except Exception as e:
-                with open(debug_path, "a", encoding="utf-8") as f:
-                    f.write(f"Command-based test message failed: {str(e)} at {time.ctime()}\n")
+            if success:
+                try:
+                    create_message_box_command("MCP Server started - Test Message")
+                    with open(debug_path, "a", encoding="utf-8") as f:
+                        f.write(f"Command-based test message triggered at {time.ctime()}\n")
+                except Exception as e:
+                    with open(debug_path, "a", encoding="utf-8") as f:
+                        f.write(f"Command-based test message failed: {str(e)} at {time.ctime()}\n")
             
             if success:
                 workspace_comm_dir = primary_comm_dir()
@@ -4551,6 +4880,8 @@ class MCPServerCommandExecuteHandler(adsk.core.CommandEventHandler):
                     f.write(f"Communication directory: {workspace_comm_dir}\n")
                 
                 ui.messageBox(f"MCP Server started successfully!\n\nServer is running at {SERVER_URL}\n\nReady for client connections.")
+            elif start_state.get("code") == "installing":
+                ui.messageBox(start_state.get("message", "Required packages are being installed automatically."))
             else:
                 workspace_comm_dir = primary_comm_dir()
                 

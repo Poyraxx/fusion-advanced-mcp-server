@@ -166,6 +166,8 @@ In installed mode, the add-in still creates runtime artifacts such as `mcp_comm/
 - Python 3.7+ for `client.py`, `deploy_addin_to_fusion.py`, and `install_mcp_for_fusion.py`
 - `mcp[cli]` and `uvicorn` installed inside Fusion 360's bundled Python
 
+On recent builds, the add-in also attempts to install missing runtime packages automatically on first launch by invoking Fusion 360's bundled `python.exe`. Manual installation is still available as a fallback.
+
 ## Installation
 
 ### 1. Install Python packages into Fusion 360's Python
@@ -176,6 +178,12 @@ Recommended:
 
 ```powershell
 python install_mcp_for_fusion.py
+```
+
+Non-interactive setup:
+
+```powershell
+python install_mcp_for_fusion.py --yes
 ```
 
 Manual fallback:
@@ -298,6 +306,7 @@ In practice, this means a Codex workflow can inspect existing Fusion Electronics
 - If the add-in starts but the client cannot connect, inspect `mcp_comm/server_status.json` and `mcp_comm/mcp_server_error.txt`.
 - If the SSE endpoint is unavailable, use the file-based path from `client.py`.
 - If package imports fail inside Fusion, rerun `install_mcp_for_fusion.py` against Fusion's bundled Python.
+- If the add-in reports missing packages on first run, wait for the automatic installer to finish and inspect `mcp_comm/mcp_runtime_install.log` for the exact `pip` output.
 - If the active document is a single-part design, component creation may be limited by Fusion 360 document rules.
 - If a needed feature is not covered by the fixed tools, use the generic bridge described above instead of treating it as unsupported.
 - If Fusion Electronics reports an intermittent document-validation error while opening an uploaded project document, inspect `fusion://electronics-documents` and activate the schematic or board document directly. The linked documents may still be valid even when the project wrapper reports a Fusion-side validation issue.
